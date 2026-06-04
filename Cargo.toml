@@ -1,0 +1,38 @@
+[package]
+name = "rttio"
+version = "1.0.0"
+edition = "2021"
+build = "build.rs"
+license = "MIT"
+description = "Tio-like serial and SEGGER RTT terminal emulator"
+readme = "README.md"
+repository = "https://github.com/wizath/rttio"
+homepage = "https://github.com/wizath/rttio"
+keywords = ["serial", "rtt", "jlink", "terminal", "embedded"]
+categories = ["command-line-utilities", "embedded"]
+
+[[bin]]
+name = "rttio"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.27"
+tokio = { version = "1", features = ["full"] }
+tokio-serial = { version = "5", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jlink-rs = { git = "https://github.com/wizath/jlink-rs", tag = "0.3.0", features = ["tokio"], optional = true }
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = ["rtt", "serial", "control"]
+rtt = ["dep:jlink-rs"]
+serial = ["dep:tokio-serial"]
+control = []
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
