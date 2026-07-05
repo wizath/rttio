@@ -1,5 +1,7 @@
 venv/
 target/
+dist/
+test.txt
 .rttio
 .rttio-sock
 *.log

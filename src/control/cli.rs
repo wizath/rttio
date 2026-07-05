@@ -44,8 +44,13 @@ pub(crate) async fn control_client_with_output(
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
 
+    let quit_command = command.trim_start().starts_with("quit")
+        && command
+            .trim_start()
+            .strip_prefix("quit")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
     let read_response = async { read_control_client_response(stream, &mut write_output).await };
-    match response_timeout {
+    let result = match response_timeout {
         Some(timeout) => tokio::time::timeout(timeout, read_response)
             .await
             .with_context(|| {
@@ -55,7 +60,17 @@ pub(crate) async fn control_client_with_output(
                 )
             })?,
         None => read_response.await,
+    };
+    if quit_command
+        && result.as_ref().is_err_and(|err| {
+            err.to_string()
+                .contains("control socket closed without response")
+        })
+    {
+        write_output(b"OK quit\n")?;
+        return Ok(());
     }
+    result
 }
 
 pub(crate) async fn read_control_client_response(

@@ -293,8 +293,27 @@ fn flash_completion_keeps_absolute_root_single_slash() {
 }
 
 #[test]
+fn flash_input_path_like_detects_typed_paths() {
+    assert!(flash_input_is_path_like("build/app.bin"));
+    assert!(flash_input_is_path_like("/tmp/app.hex"));
+    assert!(flash_input_is_path_like("./merged.uf2"));
+    assert!(!flash_input_is_path_like("merged"));
+}
+
+#[test]
+fn output_line_state_default_starts_at_line_start() {
+    let mut state = OutputLineState::default();
+    assert!(*state.at_line_start_mut(Source::Serial));
+    assert!(*state.at_line_start_mut(Source::Rtt));
+    assert!(*state.at_line_start_mut(Source::Tx));
+}
+
+#[test]
 fn rtt_connected_status_matches_only_success_lines() {
     assert!(is_serial_connected_status("connected"));
+    assert!(is_serial_connected_status(
+        "TCP serial connected 127.0.0.1:2000"
+    ));
     assert!(!is_serial_connected_status("opening /dev/tty.usbmodem101"));
     assert!(!is_serial_connected_status("failed to open"));
     assert!(is_rtt_connected_status("connected up=0 down=0"));
@@ -1396,13 +1415,7 @@ async fn control_client_protocol_has_no_connect_banner() {
 
     let handle = tokio::spawn(handle_control_client(
         server,
-        input_tx,
-        terminal_tx,
-        output_rx,
-        raw_rx,
-        history,
-        state,
-        LineEnding::CrLf,
+        test_control_client_context(input_tx, terminal_tx, output_rx, raw_rx, history, state),
     ));
 
     let (reader, mut writer) = client.into_split();
@@ -1453,13 +1466,7 @@ async fn control_client_idle_timeout_releases_connection() {
 
     let handle = tokio::spawn(handle_control_client(
         server,
-        input_tx,
-        terminal_tx,
-        output_rx,
-        raw_rx,
-        history,
-        state,
-        LineEnding::CrLf,
+        test_control_client_context(input_tx, terminal_tx, output_rx, raw_rx, history, state),
     ));
 
     let mut reader = BufReader::new(client);
@@ -1689,13 +1696,7 @@ async fn control_client_status_returns_after_response() {
         let state = test_control_state();
         handle_control_client(
             stream,
-            input_tx,
-            terminal_tx,
-            output_rx,
-            raw_rx,
-            history,
-            state,
-            LineEnding::CrLf,
+            test_control_client_context(input_tx, terminal_tx, output_rx, raw_rx, history, state),
         )
         .await;
     });
@@ -2604,13 +2605,16 @@ async fn control_raw_read_marks_truncated_history_incomplete() {
     let response = collect_control_raw_read(
         &mut raw_rx,
         &history,
-        ControlSource::Serial,
-        Duration::from_millis(0),
-        Some(1),
-        None,
-        None,
-        true,
-        false,
+        &ControlRawReadParams {
+            source: ControlSource::Serial,
+            timeout: Duration::from_millis(0),
+            since: Some(1),
+            until_hex: None,
+            max_bytes: None,
+            fail_on_timeout: false,
+            raw_hex: true,
+            raw_text: false,
+        },
     )
     .await;
 
@@ -2631,13 +2635,16 @@ async fn control_raw_read_recovers_lagged_broadcast_from_history() {
             collect_control_raw_read(
                 &mut raw_rx,
                 &history,
-                ControlSource::Serial,
-                Duration::from_millis(100),
-                None,
-                Some(b"abc"),
-                None,
-                true,
-                false,
+                &ControlRawReadParams {
+                    source: ControlSource::Serial,
+                    timeout: Duration::from_millis(100),
+                    since: None,
+                    until_hex: Some(b"abc".to_vec()),
+                    max_bytes: None,
+                    fail_on_timeout: false,
+                    raw_hex: true,
+                    raw_text: false,
+                },
             )
             .await
         }
@@ -3225,24 +3232,38 @@ async fn control_reset_json_without_rtt_returns_unavailable_error() {
     let history = Arc::new(Mutex::new(ControlHistory::new(1024)));
     let state = test_control_state();
 
-    let response = handle_control_line(
-        "reset --json",
-        &input_tx,
-        &mut output_rx,
-        &mut raw_rx,
-        &history,
-        &state,
-        LineEnding::CrLf,
-    )
-    .await;
-    assert!(input_rx.try_recv().is_err());
+    let request = tokio::spawn({
+        let history = Arc::clone(&history);
+        let state = Arc::clone(&state);
+        async move {
+            handle_control_line(
+                "reset --json",
+                &input_tx,
+                &mut output_rx,
+                &mut raw_rx,
+                &history,
+                &state,
+                LineEnding::CrLf,
+            )
+            .await
+        }
+    });
+    match input_rx.recv().await.unwrap() {
+        InputEvent::Control(ControlRequest::Reset { reply }) => {
+            reply
+                .send("ERR reset requires target flasher\n".to_string())
+                .unwrap();
+        }
+        other => panic!("unexpected input event: {other:?}"),
+    }
+    let response = request.await.unwrap();
     let json: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     assert_eq!(json["ok"], false);
     assert_eq!(json["code"], "unavailable");
     assert!(json["error"]
         .as_str()
         .unwrap()
-        .contains("requires active RTT/J-Link target"));
+        .contains("requires target flasher"));
 }
 
 #[tokio::test]
@@ -3253,24 +3274,38 @@ async fn control_erase_json_without_rtt_returns_unavailable_error() {
     let history = Arc::new(Mutex::new(ControlHistory::new(1024)));
     let state = test_control_state();
 
-    let response = handle_control_line(
-        "erase --json",
-        &input_tx,
-        &mut output_rx,
-        &mut raw_rx,
-        &history,
-        &state,
-        LineEnding::CrLf,
-    )
-    .await;
-    assert!(input_rx.try_recv().is_err());
+    let request = tokio::spawn({
+        let history = Arc::clone(&history);
+        let state = Arc::clone(&state);
+        async move {
+            handle_control_line(
+                "erase --json",
+                &input_tx,
+                &mut output_rx,
+                &mut raw_rx,
+                &history,
+                &state,
+                LineEnding::CrLf,
+            )
+            .await
+        }
+    });
+    match input_rx.recv().await.unwrap() {
+        InputEvent::Control(ControlRequest::Erase { reply }) => {
+            reply
+                .send("ERR erase requires target flasher\n".to_string())
+                .unwrap();
+        }
+        other => panic!("unexpected input event: {other:?}"),
+    }
+    let response = request.await.unwrap();
     let json: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     assert_eq!(json["ok"], false);
     assert_eq!(json["code"], "unavailable");
     assert!(json["error"]
         .as_str()
         .unwrap()
-        .contains("requires active RTT/J-Link target"));
+        .contains("requires target flasher"));
 }
 
 #[tokio::test]
@@ -3314,6 +3349,87 @@ async fn control_erase_json_wraps_jlink_reported_result() {
     assert_eq!(json["timeout_ms"], CONTROL_ACTION_TIMEOUT_MS);
     assert_eq!(json["reported_result"], "chip erased");
     assert_eq!(json["message"], "erase done, J-Link reported chip erased");
+}
+
+#[tokio::test]
+async fn control_reset_routes_to_serial_transport_when_serial_active() {
+    let (serial_tx, mut serial_rx) = mpsc::channel(1);
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+
+    handle_control_request(
+        ControlRequest::Reset { reply },
+        Route::Serial,
+        &Some(serial_tx),
+        &None,
+    )
+    .await;
+
+    match serial_rx.recv().await.unwrap() {
+        InterfaceCommand::Reset { reply: Some(reply) } => {
+            let _ = reply.send("OK reset\n".to_string());
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn control_flash_routes_to_serial_transport_when_serial_active() {
+    let root = std::env::temp_dir().join(format!(
+        "rttio-test-{}-{}",
+        std::process::id(),
+        unique_test_id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("app.bin");
+    fs::write(&file, b"firmware").unwrap();
+    let (serial_tx, mut serial_rx) = mpsc::channel(1);
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+
+    handle_control_request(
+        ControlRequest::Flash {
+            path: file.clone(),
+            addr: 0x1000,
+            reply,
+        },
+        Route::Serial,
+        &Some(serial_tx),
+        &None,
+    )
+    .await;
+
+    match serial_rx.recv().await.unwrap() {
+        InterfaceCommand::Flash { path, addr, reply } => {
+            assert_eq!(path, file);
+            assert_eq!(addr, 0x1000);
+            let _ = reply
+                .unwrap()
+                .send("OK ESP flash done, wrote 8 bytes\n".to_string());
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn control_erase_routes_to_serial_transport_when_serial_active() {
+    let (serial_tx, mut serial_rx) = mpsc::channel(1);
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+
+    handle_control_request(
+        ControlRequest::Erase { reply },
+        Route::Serial,
+        &Some(serial_tx),
+        &None,
+    )
+    .await;
+
+    match serial_rx.recv().await.unwrap() {
+        InterfaceCommand::Erase { reply: Some(reply) } => {
+            let _ = reply.send("OK ESP erase done\n".to_string());
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -3421,24 +3537,39 @@ async fn control_flash_json_without_rtt_returns_unavailable_error() {
     let state = test_control_state();
     let command = format!("flash --json --timeout 100 \"{}\"", file.display());
 
-    let response = handle_control_line(
-        &command,
-        &input_tx,
-        &mut output_rx,
-        &mut raw_rx,
-        &history,
-        &state,
-        LineEnding::CrLf,
-    )
-    .await;
-    assert!(input_rx.try_recv().is_err());
+    let request = tokio::spawn({
+        let history = Arc::clone(&history);
+        let state = Arc::clone(&state);
+        let command = command.clone();
+        async move {
+            handle_control_line(
+                &command,
+                &input_tx,
+                &mut output_rx,
+                &mut raw_rx,
+                &history,
+                &state,
+                LineEnding::CrLf,
+            )
+            .await
+        }
+    });
+    match input_rx.recv().await.unwrap() {
+        InputEvent::Control(ControlRequest::Flash { reply, .. }) => {
+            reply
+                .send("ERR flash requires target flasher\n".to_string())
+                .unwrap();
+        }
+        other => panic!("unexpected input event: {other:?}"),
+    }
+    let response = request.await.unwrap();
     let json: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
     assert_eq!(json["ok"], false);
     assert_eq!(json["code"], "unavailable");
     assert!(json["error"]
         .as_str()
         .unwrap()
-        .contains("requires active RTT/J-Link target"));
+        .contains("requires target flasher"));
 
     fs::remove_dir_all(&root).unwrap();
 }
@@ -3743,7 +3874,7 @@ async fn control_reset_without_rtt_returns_error() {
 
     assert_eq!(
         response.await.unwrap(),
-        "ERR reset requires RTT/J-Link\n".to_string()
+        "ERR reset requires target flasher\n".to_string()
     );
 }
 
@@ -3754,7 +3885,7 @@ async fn control_erase_without_rtt_returns_error() {
 
     assert_eq!(
         response.await.unwrap(),
-        "ERR erase requires RTT/J-Link\n".to_string()
+        "ERR erase requires target flasher\n".to_string()
     );
 }
 
@@ -3808,6 +3939,31 @@ fn config_save_writes_current_version_and_repairs_recent_flash() {
     assert_eq!(saved.version, CONFIG_VERSION);
     assert_eq!(saved.recent_flash.len(), 10);
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn config_tracks_recent_bin_flash_addresses_by_path() {
+    let keep = PathBuf::from("build/app.bin");
+    let drop = PathBuf::from("build/old.bin");
+    let mut config = RttioConfig {
+        recent_flash: vec![keep.clone()],
+        recent_flash_addr: vec![
+            RecentFlashAddress {
+                path: keep.clone(),
+                addr: 0x1000,
+            },
+            RecentFlashAddress {
+                path: drop,
+                addr: 0x2000,
+            },
+        ],
+        ..RttioConfig::default()
+    };
+
+    config.normalize();
+
+    assert_eq!(recent_flash_addr(&config, &keep), Some(0x1000));
+    assert_eq!(config.recent_flash_addr.len(), 1);
 }
 
 fn temp_config_path(name: &str) -> PathBuf {
@@ -3864,6 +4020,25 @@ fn test_control_state() -> Arc<Mutex<ControlRuntimeState>> {
     }))
 }
 
+fn test_control_client_context(
+    input_tx: mpsc::Sender<InputEvent>,
+    terminal_tx: mpsc::Sender<TerminalEvent>,
+    output_rx: broadcast::Receiver<String>,
+    raw_rx: broadcast::Receiver<ControlOutput>,
+    history: Arc<Mutex<ControlHistory>>,
+    state: Arc<Mutex<ControlRuntimeState>>,
+) -> ControlClientContext {
+    ControlClientContext {
+        input_tx,
+        terminal_tx,
+        output_rx,
+        raw_rx,
+        history,
+        state,
+        line_ending: LineEnding::CrLf,
+    }
+}
+
 fn test_control_state_with_route(route: Route) -> Arc<Mutex<ControlRuntimeState>> {
     let state = test_control_state();
     {
@@ -3887,4 +4062,101 @@ fn test_control_state_with_route(route: Route) -> Arc<Mutex<ControlRuntimeState>
         }
     }
     state
+}
+
+#[cfg(feature = "control")]
+#[test]
+fn output_cursor_position_stays_above_status_bar_after_resize() {
+    assert_eq!(output_cursor_position(10, 23, 80, 24), (10, 22));
+    assert_eq!(output_cursor_position(999, 999, 80, 24), (79, 22));
+    assert_eq!(output_cursor_position(5, 5, 0, 1), (0, 0));
+}
+
+#[cfg(feature = "control")]
+#[test]
+fn output_cursor_resize_moves_to_bottom_of_output_area() {
+    let compressed = output_cursor_position(20, 30, 80, 8);
+    assert_eq!(compressed, (20, 6));
+    assert_eq!(
+        output_cursor_after_resize(compressed, Some(8), 80, 30),
+        (20, 28)
+    );
+}
+
+#[cfg(feature = "control")]
+#[test]
+fn output_cursor_resize_preserves_non_bottom_position() {
+    assert_eq!(
+        output_cursor_after_resize((20, 6), Some(30), 80, 40),
+        (20, 6)
+    );
+}
+
+#[cfg(feature = "control")]
+#[test]
+fn output_cursor_tracking_handles_cr_lf_wrap_and_ansi() {
+    let mut cursor = (0, 0);
+    update_output_cursor_position_with_size("abc", &mut cursor, 5, 4);
+    assert_eq!(cursor, (3, 0));
+
+    update_output_cursor_position_with_size("\rZ\n", &mut cursor, 5, 4);
+    assert_eq!(cursor, (0, 1));
+
+    update_output_cursor_position_with_size("12345", &mut cursor, 5, 4);
+    assert_eq!(cursor, (0, 2));
+
+    update_output_cursor_position_with_size("\x1b[31mred\x1b[0m", &mut cursor, 10, 6);
+    assert_eq!(cursor, (3, 2));
+}
+
+#[test]
+fn terminal_output_buffers_incomplete_ansi_suffixes() {
+    let mut pending = String::new();
+
+    assert_eq!(take_complete_terminal_output(&mut pending, "a\x1b"), "a");
+    assert_eq!(pending, "\x1b");
+
+    assert_eq!(take_complete_terminal_output(&mut pending, "[0"), "");
+    assert_eq!(pending, "\x1b[0");
+
+    assert_eq!(
+        take_complete_terminal_output(&mut pending, "m<inf>"),
+        "\x1b[0m<inf>"
+    );
+    assert!(pending.is_empty());
+
+    assert_eq!(
+        take_complete_terminal_output(&mut pending, "\x1b[31mred\x1b[0m"),
+        "\x1b[31mred\x1b[0m"
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn terminal_ansi_style_tracks_current_sgr_for_statusbar_restore() {
+    let mut style = TerminalAnsiStyle::default();
+
+    style.update("\x1b[33m<wrn> modem_manager:");
+    assert_eq!(style.restore_sequence(), "\x1b[33m");
+
+    style.update(" reset GPIO unavailable");
+    assert_eq!(style.restore_sequence(), "\x1b[33m");
+
+    style.update("\x1b[0;31m<err>");
+    assert_eq!(style.restore_sequence(), "\x1b[0;31m");
+
+    style.update("\x1b[0m");
+    assert_eq!(style.restore_sequence(), "");
+}
+
+#[cfg(feature = "control")]
+#[test]
+fn flash_progress_status_segment_shows_action_and_percent() {
+    let rendered = format_flash_progress(&TerminalFlashProgress {
+        action: "flash 0x00000000".to_string(),
+        percent: 42,
+    });
+
+    assert!(rendered.contains("flash:[####------]  42%"));
+    assert!(rendered.contains("flash 0x00000000"));
 }

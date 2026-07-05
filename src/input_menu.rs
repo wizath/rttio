@@ -34,8 +34,21 @@ pub(crate) fn spawn_input_task(
             if event::poll(Duration::from_millis(100)).ok() != Some(true) {
                 continue;
             }
-            let Ok(Event::Key(key)) = event::read() else {
-                continue;
+            let key = match event::read() {
+                Ok(Event::Key(key)) => key,
+                Ok(Event::Resize(_, _)) => {
+                    if menu_mode {
+                        if help_mode {
+                            let _ = try_terminal_send(&terminal_tx, TerminalEvent::ShowHelp);
+                        } else {
+                            draw_ctrl_t_menu(&terminal_tx, menu_selected);
+                        }
+                    } else {
+                        let _ = try_terminal_send(&terminal_tx, TerminalEvent::Resize);
+                    }
+                    continue;
+                }
+                _ => continue,
             };
 
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
@@ -43,9 +56,16 @@ pub(crate) fn spawn_input_task(
                 help_mode = false;
                 menu_selected = 0;
                 command_view_active.store(true, Ordering::Release);
-                if !open_ctrl_t_menu(&terminal_tx, menu_selected) {
-                    command_view_active.store(false, Ordering::Release);
-                    return;
+                match open_ctrl_t_menu(&terminal_tx, menu_selected) {
+                    TerminalSend::Sent => {}
+                    TerminalSend::Full => {
+                        menu_mode = false;
+                        command_view_active.store(false, Ordering::Release);
+                    }
+                    TerminalSend::Closed => {
+                        command_view_active.store(false, Ordering::Release);
+                        return;
+                    }
                 }
                 continue;
             }
@@ -86,8 +106,13 @@ pub(crate) fn spawn_input_task(
                         draw_ctrl_t_menu(&terminal_tx, menu_selected);
                     }
                     KeyCode::Enter => {
-                        let result =
-                            run_menu_selection(menu_selected, jlink_actions, &tx, &terminal_tx);
+                        let result = run_menu_selection(
+                            menu_selected,
+                            jlink_actions,
+                            &tx,
+                            &terminal_tx,
+                            &thread_running,
+                        );
                         if result.is_break() {
                             command_view_active.store(false, Ordering::Release);
                             return;
@@ -101,16 +126,23 @@ pub(crate) fn spawn_input_task(
                     }
                     KeyCode::Char('h') | KeyCode::Char('?') => {
                         help_mode = true;
-                        if terminal_tx.blocking_send(TerminalEvent::ShowHelp).is_err() {
-                            return;
+                        match try_terminal_send(&terminal_tx, TerminalEvent::ShowHelp) {
+                            TerminalSend::Sent => {}
+                            TerminalSend::Full => {
+                                help_mode = false;
+                            }
+                            TerminalSend::Closed => return,
                         }
                     }
                     KeyCode::Char('l') | KeyCode::Char('L') => {
                         menu_mode = false;
                         command_view_active.store(false, Ordering::Release);
-                        if tx
-                            .blocking_send(InputEvent::MenuCommand(MenuCommand::ClearScreen))
-                            .is_err()
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::ClearScreen),
+                        )
+                        .is_break()
                         {
                             return;
                         }
@@ -119,9 +151,12 @@ pub(crate) fn spawn_input_task(
                         menu_mode = false;
                         command_view_active.store(false, Ordering::Release);
                         close_ctrl_t_menu(&terminal_tx);
-                        if tx
-                            .blocking_send(InputEvent::MenuCommand(MenuCommand::ClearControlBuffer))
-                            .is_err()
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::ClearControlBuffer),
+                        )
+                        .is_break()
                         {
                             return;
                         }
@@ -130,9 +165,12 @@ pub(crate) fn spawn_input_task(
                         menu_mode = false;
                         command_view_active.store(false, Ordering::Release);
                         close_ctrl_t_menu(&terminal_tx);
-                        if tx
-                            .blocking_send(InputEvent::MenuCommand(MenuCommand::ToggleOutputPause))
-                            .is_err()
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::ToggleOutputPause),
+                        )
+                        .is_break()
                         {
                             return;
                         }
@@ -141,9 +179,12 @@ pub(crate) fn spawn_input_task(
                         menu_mode = false;
                         command_view_active.store(false, Ordering::Release);
                         close_ctrl_t_menu(&terminal_tx);
-                        if tx
-                            .blocking_send(InputEvent::MenuCommand(MenuCommand::ToggleEcho))
-                            .is_err()
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::ToggleEcho),
+                        )
+                        .is_break()
                         {
                             return;
                         }
@@ -152,9 +193,12 @@ pub(crate) fn spawn_input_task(
                         menu_mode = false;
                         command_view_active.store(false, Ordering::Release);
                         close_ctrl_t_menu(&terminal_tx);
-                        if tx
-                            .blocking_send(InputEvent::MenuCommand(MenuCommand::ToggleTimestamps))
-                            .is_err()
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::ToggleTimestamps),
+                        )
+                        .is_break()
                         {
                             return;
                         }
@@ -163,9 +207,12 @@ pub(crate) fn spawn_input_task(
                         menu_mode = false;
                         command_view_active.store(false, Ordering::Release);
                         close_ctrl_t_menu(&terminal_tx);
-                        if tx
-                            .blocking_send(InputEvent::MenuCommand(MenuCommand::ToggleOutputMode))
-                            .is_err()
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::ToggleOutputMode),
+                        )
+                        .is_break()
                         {
                             return;
                         }
@@ -175,12 +222,15 @@ pub(crate) fn spawn_input_task(
                         command_view_active.store(false, Ordering::Release);
                         close_ctrl_t_menu(&terminal_tx);
                         if !jlink_actions {
-                            terminal_status_blocking(&terminal_tx, "reset requires RTT/J-Link");
+                            terminal_status_blocking(&terminal_tx, "reset requires target flasher");
                             continue;
                         }
-                        if tx
-                            .blocking_send(InputEvent::MenuCommand(MenuCommand::Reset))
-                            .is_err()
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::Reset),
+                        )
+                        .is_break()
                         {
                             return;
                         }
@@ -189,9 +239,12 @@ pub(crate) fn spawn_input_task(
                         menu_mode = false;
                         command_view_active.store(false, Ordering::Release);
                         close_ctrl_t_menu(&terminal_tx);
-                        if tx
-                            .blocking_send(InputEvent::MenuCommand(MenuCommand::Reconnect))
-                            .is_err()
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::Reconnect),
+                        )
+                        .is_break()
                         {
                             return;
                         }
@@ -201,18 +254,40 @@ pub(crate) fn spawn_input_task(
                         command_view_active.store(false, Ordering::Release);
                         if !jlink_actions {
                             close_ctrl_t_menu(&terminal_tx);
-                            terminal_status_blocking(&terminal_tx, "flash requires RTT/J-Link");
+                            terminal_status_blocking(&terminal_tx, "flash requires target flasher");
                             continue;
                         }
-                        if run_flash_prompt_from_menu(&tx, &terminal_tx).is_break() {
+                        if run_flash_prompt_from_menu(&tx, &terminal_tx, &thread_running).is_break()
+                        {
+                            return;
+                        }
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('X') => {
+                        menu_mode = false;
+                        command_view_active.store(false, Ordering::Release);
+                        close_ctrl_t_menu(&terminal_tx);
+                        if !jlink_actions {
+                            terminal_status_blocking(&terminal_tx, "erase requires target flasher");
+                            continue;
+                        }
+                        if send_input_event(
+                            &tx,
+                            &terminal_tx,
+                            InputEvent::MenuCommand(MenuCommand::Erase),
+                        )
+                        .is_break()
+                        {
                             return;
                         }
                     }
                     KeyCode::Char('q') => {
+                        thread_running.store(false, Ordering::Release);
                         command_view_active.store(false, Ordering::Release);
                         close_ctrl_t_menu(&terminal_tx);
-                        let _ = tx.blocking_send(InputEvent::Quit);
-                        return;
+                        match send_input_event(&tx, &terminal_tx, InputEvent::Quit) {
+                            MenuRun::Break => return,
+                            MenuRun::Continue | MenuRun::KeepOpen => {}
+                        }
                     }
                     KeyCode::Char(c) => {
                         menu_mode = false;
@@ -236,90 +311,57 @@ pub(crate) fn spawn_input_task(
             match key.code {
                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(byte) = control_byte(c) {
-                        if tx.blocking_send(InputEvent::Bytes(vec![byte])).is_err() {
+                        if send_input_event(&tx, &terminal_tx, InputEvent::Bytes(vec![byte]))
+                            .is_break()
+                        {
                             return;
                         }
                     }
                 }
                 KeyCode::Enter => {
-                    if tx.blocking_send(InputEvent::Line(String::new())).is_err() {
+                    if send_input_event(&tx, &terminal_tx, InputEvent::Line(String::new()))
+                        .is_break()
+                    {
                         return;
                     }
                 }
                 KeyCode::Char(c) => {
                     let mut encoded = [0; 4];
                     let bytes = c.encode_utf8(&mut encoded).as_bytes().to_vec();
-                    if tx.blocking_send(InputEvent::Bytes(bytes)).is_err() {
+                    if send_input_event(&tx, &terminal_tx, InputEvent::Bytes(bytes)).is_break() {
                         return;
                     }
                 }
                 KeyCode::Backspace => {
-                    if tx.blocking_send(InputEvent::Bytes(vec![0x08])).is_err() {
+                    if send_input_event(&tx, &terminal_tx, InputEvent::Bytes(vec![0x08])).is_break()
+                    {
                         return;
                     }
                 }
                 KeyCode::Tab => {
-                    if tx.blocking_send(InputEvent::Bytes(vec![b'\t'])).is_err() {
+                    if send_input_event(&tx, &terminal_tx, InputEvent::Bytes(vec![b'\t']))
+                        .is_break()
+                    {
                         return;
                     }
                 }
                 KeyCode::Esc => {
-                    if tx.blocking_send(InputEvent::Bytes(vec![0x1b])).is_err() {
-                        return;
-                    }
-                }
-                KeyCode::Up => {
-                    if tx
-                        .blocking_send(InputEvent::Bytes(b"\x1b[A".to_vec()))
-                        .is_err()
+                    if send_input_event(&tx, &terminal_tx, InputEvent::Bytes(vec![0x1b])).is_break()
                     {
                         return;
                     }
                 }
-                KeyCode::Down => {
-                    if tx
-                        .blocking_send(InputEvent::Bytes(b"\x1b[B".to_vec()))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                KeyCode::Right => {
-                    if tx
-                        .blocking_send(InputEvent::Bytes(b"\x1b[C".to_vec()))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                KeyCode::Left => {
-                    if tx
-                        .blocking_send(InputEvent::Bytes(b"\x1b[D".to_vec()))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                KeyCode::Home => {
-                    if tx
-                        .blocking_send(InputEvent::Bytes(b"\x1b[H".to_vec()))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                KeyCode::End => {
-                    if tx
-                        .blocking_send(InputEvent::Bytes(b"\x1b[F".to_vec()))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Right
+                | KeyCode::Left
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown => {}
                 KeyCode::Delete => {
-                    if tx
-                        .blocking_send(InputEvent::Bytes(b"\x1b[3~".to_vec()))
-                        .is_err()
+                    if send_input_event(&tx, &terminal_tx, InputEvent::Bytes(b"\x1b[3~".to_vec()))
+                        .is_break()
                     {
                         return;
                     }
@@ -343,6 +385,7 @@ pub(crate) enum CtrlTMenuAction {
     Reset,
     Reconnect,
     Flash,
+    Erase,
     Quit,
     Cancel,
 }
@@ -416,6 +459,12 @@ pub(crate) const CTRL_T_MENU: &[CtrlTMenuEntry] = &[
         jlink_only: true,
     },
     CtrlTMenuEntry {
+        key: "x",
+        desc: "erase chip",
+        action: CtrlTMenuAction::Erase,
+        jlink_only: true,
+    },
+    CtrlTMenuEntry {
         key: "q",
         desc: "quit",
         action: CtrlTMenuAction::Quit,
@@ -469,10 +518,11 @@ pub(crate) fn run_menu_selection(
     jlink_actions: bool,
     tx: &mpsc::Sender<InputEvent>,
     terminal_tx: &mpsc::Sender<TerminalEvent>,
+    running: &AtomicBool,
 ) -> MenuRun {
     match ctrl_t_menu_entry(index, jlink_actions).map(|entry| entry.action) {
         Some(CtrlTMenuAction::Help) => {
-            let _ = terminal_tx.blocking_send(TerminalEvent::ShowHelp);
+            let _ = try_terminal_send(terminal_tx, TerminalEvent::ShowHelp);
             MenuRun::KeepOpen
         }
         Some(CtrlTMenuAction::ClearScreen) => send_menu_command(tx, MenuCommand::ClearScreen),
@@ -497,10 +547,13 @@ pub(crate) fn run_menu_selection(
         Some(CtrlTMenuAction::Reconnect) => {
             close_then_send_menu_command(terminal_tx, tx, MenuCommand::Reconnect)
         }
-        Some(CtrlTMenuAction::Flash) => run_flash_prompt_from_menu(tx, terminal_tx),
+        Some(CtrlTMenuAction::Flash) => run_flash_prompt_from_menu(tx, terminal_tx, running),
+        Some(CtrlTMenuAction::Erase) => {
+            close_then_send_menu_command(terminal_tx, tx, MenuCommand::Erase)
+        }
         Some(CtrlTMenuAction::Quit) => {
             close_ctrl_t_menu(terminal_tx);
-            let _ = tx.blocking_send(InputEvent::Quit);
+            let _ = send_input_event(tx, terminal_tx, InputEvent::Quit);
             MenuRun::Break
         }
         Some(CtrlTMenuAction::Cancel) => MenuRun::Continue,
@@ -509,10 +562,10 @@ pub(crate) fn run_menu_selection(
 }
 
 pub(crate) fn send_menu_command(tx: &mpsc::Sender<InputEvent>, command: MenuCommand) -> MenuRun {
-    if tx.blocking_send(InputEvent::MenuCommand(command)).is_err() {
-        MenuRun::Break
-    } else {
-        MenuRun::Continue
+    match tx.try_send(InputEvent::MenuCommand(command)) {
+        Ok(()) => MenuRun::Continue,
+        Err(mpsc::error::TrySendError::Full(_)) => MenuRun::Continue,
+        Err(mpsc::error::TrySendError::Closed(_)) => MenuRun::Break,
     }
 }
 
@@ -522,22 +575,56 @@ pub(crate) fn close_then_send_menu_command(
     command: MenuCommand,
 ) -> MenuRun {
     close_ctrl_t_menu(terminal_tx);
-    send_menu_command(tx, command)
+    send_input_event(tx, terminal_tx, InputEvent::MenuCommand(command))
 }
 
-pub(crate) fn open_ctrl_t_menu(tx: &mpsc::Sender<TerminalEvent>, selected: usize) -> bool {
-    tx.blocking_send(TerminalEvent::ShowMenu(selected)).is_ok()
+pub(crate) fn send_input_event(
+    tx: &mpsc::Sender<InputEvent>,
+    terminal_tx: &mpsc::Sender<TerminalEvent>,
+    event: InputEvent,
+) -> MenuRun {
+    match tx.try_send(event) {
+        Ok(()) => MenuRun::Continue,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            terminal_status_blocking(terminal_tx, "input queue full; dropped key");
+            MenuRun::Continue
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => MenuRun::Break,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalSend {
+    Sent,
+    Full,
+    Closed,
+}
+
+pub(crate) fn try_terminal_send(
+    tx: &mpsc::Sender<TerminalEvent>,
+    event: TerminalEvent,
+) -> TerminalSend {
+    match tx.try_send(event) {
+        Ok(()) => TerminalSend::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => TerminalSend::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => TerminalSend::Closed,
+    }
+}
+
+pub(crate) fn open_ctrl_t_menu(tx: &mpsc::Sender<TerminalEvent>, selected: usize) -> TerminalSend {
+    try_terminal_send(tx, TerminalEvent::ShowMenu(selected))
 }
 
 pub(crate) fn close_ctrl_t_menu(tx: &mpsc::Sender<TerminalEvent>) {
-    let _ = tx.blocking_send(TerminalEvent::HideMenu);
+    let _ = try_terminal_send(tx, TerminalEvent::HideMenu);
 }
 
 pub(crate) fn run_flash_prompt_from_menu(
     tx: &mpsc::Sender<InputEvent>,
     terminal_tx: &mpsc::Sender<TerminalEvent>,
+    running: &AtomicBool,
 ) -> MenuRun {
-    let command = prompt_flash_command(terminal_tx);
+    let command = prompt_flash_command(terminal_tx, running);
     close_ctrl_t_menu(terminal_tx);
 
     if let Some(command) = command {
@@ -548,7 +635,7 @@ pub(crate) fn run_flash_prompt_from_menu(
 }
 
 pub(crate) fn draw_ctrl_t_menu(tx: &mpsc::Sender<TerminalEvent>, selected: usize) {
-    let _ = tx.blocking_send(TerminalEvent::ShowMenu(selected));
+    let _ = try_terminal_send(tx, TerminalEvent::ShowMenu(selected));
 }
 
 pub(crate) fn draw_ctrl_t_menu_to(
@@ -712,12 +799,19 @@ pub(crate) fn control_byte(c: char) -> Option<u8> {
 
 pub(crate) fn prompt_flash_command(
     terminal_tx: &mpsc::Sender<TerminalEvent>,
+    running: &AtomicBool,
 ) -> Option<MenuCommand> {
-    let path = prompt_flash_path(terminal_tx)?;
+    let path = prompt_flash_path(terminal_tx, running)?;
     let addr = if flash_file_uses_embedded_address(&path) {
         0
     } else {
-        prompt_flash_address(&path, terminal_tx)?
+        let config = load_config_or_default_for_ui(terminal_tx);
+        prompt_flash_address(
+            &path,
+            recent_flash_addr(&config, &path),
+            terminal_tx,
+            running,
+        )?
     };
     Some(MenuCommand::Flash { path, addr })
 }
@@ -734,12 +828,22 @@ pub(crate) fn flash_file_uses_embedded_address(path: &Path) -> bool {
 
 pub(crate) fn prompt_flash_address(
     path: &Path,
+    default_addr: Option<u32>,
     terminal_tx: &mpsc::Sender<TerminalEvent>,
+    running: &AtomicBool,
 ) -> Option<u32> {
-    let mut input = String::new();
+    let mut input = default_addr
+        .map(|addr| format!("0x{addr:08x}"))
+        .unwrap_or_default();
     draw_flash_address_prompt(path, &input);
 
     loop {
+        if !running.load(Ordering::Acquire) {
+            return None;
+        }
+        if event::poll(Duration::from_millis(100)).ok() != Some(true) {
+            continue;
+        }
         let Ok(Event::Key(key)) = event::read() else {
             continue;
         };
@@ -809,7 +913,10 @@ pub(crate) fn draw_flash_address_prompt(path: &Path, input: &str) {
     let _ = stdout.flush();
 }
 
-pub(crate) fn prompt_flash_path(terminal_tx: &mpsc::Sender<TerminalEvent>) -> Option<PathBuf> {
+pub(crate) fn prompt_flash_path(
+    terminal_tx: &mpsc::Sender<TerminalEvent>,
+    running: &AtomicBool,
+) -> Option<PathBuf> {
     let candidates = build_flash_candidates(terminal_tx);
     let mut shown = filter_flash_candidates(&candidates, "");
 
@@ -821,6 +928,12 @@ pub(crate) fn prompt_flash_path(terminal_tx: &mpsc::Sender<TerminalEvent>) -> Op
     draw_flash_picker(&shown, selected, scroll, &input);
 
     loop {
+        if !running.load(Ordering::Acquire) {
+            return None;
+        }
+        if event::poll(Duration::from_millis(100)).ok() != Some(true) {
+            continue;
+        }
         let Ok(Event::Key(key)) = event::read() else {
             continue;
         };
@@ -851,10 +964,15 @@ pub(crate) fn prompt_flash_path(terminal_tx: &mpsc::Sender<TerminalEvent>) -> Op
                     if let Some(path) = shown.get(selected) {
                         return Some(path.clone());
                     }
-                } else if let Some(path) = shown.get(selected) {
-                    return Some(path.clone());
                 } else {
-                    return Some(PathBuf::from(input.trim()));
+                    let typed = PathBuf::from(input.trim());
+                    if flash_input_is_path_like(input.trim()) {
+                        return Some(typed);
+                    }
+                    if let Some(path) = shown.get(selected) {
+                        return Some(path.clone());
+                    }
+                    return Some(typed);
                 }
             }
             KeyCode::Backspace => {
@@ -890,6 +1008,14 @@ pub(crate) fn prompt_flash_path(terminal_tx: &mpsc::Sender<TerminalEvent>) -> Op
             _ => {}
         }
     }
+}
+
+pub(crate) fn flash_input_is_path_like(input: &str) -> bool {
+    input.contains('/')
+        || input.contains('\\')
+        || input.starts_with('.')
+        || input.starts_with('~')
+        || is_flash_file(Path::new(input))
 }
 
 pub(crate) fn filter_flash_candidates(candidates: &[PathBuf], input: &str) -> Vec<PathBuf> {
@@ -961,7 +1087,6 @@ pub(crate) fn is_flash_file(path: &Path) -> bool {
     )
 }
 
-#[cfg(any(feature = "rtt", feature = "control"))]
 pub(crate) fn validate_flash_file(path: &Path) -> Result<()> {
     if !path.exists() {
         return Err(anyhow!("{} does not exist", path.display()));
@@ -1242,7 +1367,7 @@ pub(crate) async fn handle_menu_command(command: MenuCommand, context: MenuComma
     } = context;
     match command {
         MenuCommand::ClearScreen => {
-            let _ = terminal_tx.send(TerminalEvent::ClearScreen).await;
+            let _ = terminal_tx.try_send(TerminalEvent::ClearScreen);
         }
         MenuCommand::ClearControlBuffer => {
             #[cfg(feature = "control")]
@@ -1301,48 +1426,54 @@ pub(crate) async fn handle_menu_command(command: MenuCommand, context: MenuComma
             .await;
         }
         MenuCommand::Reset => {
-            #[cfg(feature = "rtt")]
             if let Some(tx) = rtt_tx {
-                tx.send(InterfaceCommand::Reset { reply: None }).await.ok();
+                let _ = tx.try_send(InterfaceCommand::Reset { reply: None });
+            } else if let Some(tx) = serial_tx {
+                let _ = tx.try_send(InterfaceCommand::Reset { reply: None });
             } else {
-                terminal_status(terminal_tx, "reset requires RTT/J-Link").await;
+                terminal_status(terminal_tx, "reset requires target flasher").await;
             }
-            #[cfg(not(feature = "rtt"))]
-            terminal_status(terminal_tx, "reset requires RTT/J-Link").await;
         }
         MenuCommand::Flash { path, addr } => {
-            #[cfg(feature = "rtt")]
             if let Some(tx) = rtt_tx {
                 if let Err(e) = validate_flash_file(&path) {
                     terminal_status(terminal_tx, &format!("flash file rejected: {e}")).await;
                     return;
                 }
-                tx.send(InterfaceCommand::Flash {
+                let _ = tx.try_send(InterfaceCommand::Flash {
                     path,
                     addr,
                     reply: None,
-                })
-                .await
-                .ok();
+                });
+            } else if let Some(tx) = serial_tx {
+                if let Err(e) = validate_flash_file(&path) {
+                    terminal_status(terminal_tx, &format!("flash file rejected: {e}")).await;
+                    return;
+                }
+                let _ = tx.try_send(InterfaceCommand::Flash {
+                    path,
+                    addr,
+                    reply: None,
+                });
             } else {
-                terminal_status(terminal_tx, "flash requires RTT/J-Link").await;
+                terminal_status(terminal_tx, "flash requires target flasher").await;
             }
-            #[cfg(not(feature = "rtt"))]
-            {
-                let _ = (path, addr);
-                terminal_status(terminal_tx, "flash requires RTT/J-Link").await;
+        }
+        MenuCommand::Erase => {
+            if let Some(tx) = rtt_tx {
+                let _ = tx.try_send(InterfaceCommand::Erase { reply: None });
+            } else if let Some(tx) = serial_tx {
+                let _ = tx.try_send(InterfaceCommand::Erase { reply: None });
+            } else {
+                terminal_status(terminal_tx, "erase requires target flasher").await;
             }
         }
         MenuCommand::Reconnect => {
             if let Some(tx) = serial_tx {
-                tx.send(InterfaceCommand::Reconnect { reply: None })
-                    .await
-                    .ok();
+                let _ = tx.try_send(InterfaceCommand::Reconnect { reply: None });
             }
             if let Some(tx) = rtt_tx {
-                tx.send(InterfaceCommand::Reconnect { reply: None })
-                    .await
-                    .ok();
+                let _ = tx.try_send(InterfaceCommand::Reconnect { reply: None });
             }
         }
     }

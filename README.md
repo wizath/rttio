@@ -2,10 +2,10 @@
 
 Tio-like terminal for serial ports and SEGGER J-Link RTT.
 
-`rttio` opens one target per process: a serial port, direct J-Link RTT, or an
-RTT stream server. It provides an interactive `Ctrl-T` command menu, optional file
-logging, timestamps, local echo, hex output, auto-reconnect, and a Unix socket
-control API for automation.
+`rttio` opens one target per process through an explicit transport command:
+`serial` or `rtt`. It provides an interactive `Ctrl-T` command menu, optional
+file logging, timestamps, local echo, hex output, auto-reconnect, raw TCP
+serving, and a Unix socket control API for automation.
 
 ## Install
 
@@ -33,15 +33,15 @@ cargo run --bin rttio -- --help
 Open a serial console:
 
 ```sh
-rttio --serial /dev/tty.usbmodem101 --baud 115200
+rttio serial /dev/tty.usbmodem101 --baud 115200
 ```
 
 Useful serial options:
 
 ```sh
-rttio --serial /dev/tty.usbmodem101 \
+rttio serial /dev/tty.usbmodem101 \
   --baud 115200 \
-  --serial-flow-control none \
+  --flow-control none \
   --line-ending cr-lf \
   --local-echo \
   --log serial.txt
@@ -55,24 +55,30 @@ software
 hardware
 ```
 
+Connect to a ser2net/raw TCP serial endpoint:
+
+```sh
+rttio serial tcp://192.168.1.50:3001
+```
+
 ## Direct J-Link RTT
 
 Open RTT through a local J-Link probe:
 
 ```sh
-rttio nRF9151_xxCA --sn 801013229
+rttio rtt nRF9151_xxCA --sn 801013229
 ```
 
 Open RTT through J-Link Remote Server/IP:
 
 ```sh
-rttio nRF9151_xxCA --jlink-ip 192.168.1.10:19020
+rttio rtt nRF9151_xxCA --jlink-ip 192.168.1.10:19020
 ```
 
 Useful RTT options:
 
 ```sh
-rttio nRF9151_xxCA \
+rttio rtt nRF9151_xxCA \
   --sn 801013229 \
   --rtt-up 0 \
   --rtt-down 0 \
@@ -92,22 +98,39 @@ JLINK_LIB
 Direct J-Link RTT supports reset, erase, and flash from the interactive menu or
 control socket.
 
+Serial sessions built with ESP support can reset, erase, and flash ESP raw
+`.bin` images from the interactive menu or control socket. After ESP flash or
+erase, `rttio` reopens the serial monitor before returning success to `ctl`.
+
 ## RTT Stream
 
 Connect to an RTT stream server instead of opening J-Link directly:
 
 ```sh
-rttio --rtt-port 19021
+rttio rtt --rtt-port 19021
 ```
 
 Use a non-local host:
 
 ```sh
-rttio --rtt-host 192.168.1.10 --rtt-port 19021
+rttio rtt --rtt-host 192.168.1.10 --rtt-port 19021
 ```
 
 RTT stream mode is terminal-only. Reset, erase, and flash require direct J-Link
 RTT mode.
+
+## Serial-over-IP
+
+`rttio` can expose the currently opened transport as a raw TCP byte stream.
+This is async and can be used with either serial or RTT:
+
+```sh
+rttio serial /dev/ttyUSB0 --baud 115200 --serve 127.0.0.1:3001
+rttio rtt nRF54L15_M33 --serve 127.0.0.1:3002
+```
+
+Bytes received from TCP clients are written to the active transport. Bytes read
+from the active transport are broadcast to connected TCP clients.
 
 ## Interactive Menu
 
@@ -130,20 +153,21 @@ q      quit
 `Ctrl-C` is passed to the target. Exit with `Ctrl-T q`.
 
 The status bar shows the selected target, serial/RTT connection state, output
-mode, echo/timestamp flags, and control buffer usage.
+mode, echo/timestamp flags, TX/RX activity, and control buffer usage. It is
+kept outside the scroll region and is redrawn across terminal resizes.
 
 ## Logging
 
 Write rendered terminal output to a file:
 
 ```sh
-rttio --serial /dev/tty.usbmodem101 --log serial.txt
+rttio serial /dev/tty.usbmodem101 --log serial.txt
 ```
 
 By default the log file is truncated on startup. Append instead:
 
 ```sh
-rttio --serial /dev/tty.usbmodem101 --log serial.txt --log-append
+rttio serial /dev/tty.usbmodem101 --log serial.txt --log-append
 ```
 
 Logging is buffered and flushed periodically, at shutdown, and when the internal
@@ -221,6 +245,7 @@ serial
 jlink_sn
 jlink_ip
 recent_flash
+recent_flash_addr
 ```
 
 Invalid JSON is ignored safely. The invalid file content is copied to

@@ -1,24 +1,29 @@
 use super::*;
 use serde::Serialize;
 
+#[derive(Clone, Copy)]
+pub(crate) struct ControlRuntimeSnapshot {
+    pub(crate) serial_running: bool,
+    pub(crate) rtt_running: bool,
+    pub(crate) route: Route,
+    pub(crate) output_mode: OutputMode,
+    pub(crate) timestamp: bool,
+    pub(crate) local_echo: bool,
+    pub(crate) output_paused: bool,
+}
+
 pub(crate) async fn update_control_runtime_state(
     state: &Arc<Mutex<ControlRuntimeState>>,
-    serial_running: bool,
-    rtt_running: bool,
-    route: Route,
-    output_mode: OutputMode,
-    timestamp: bool,
-    local_echo: bool,
-    output_paused: bool,
+    snapshot: ControlRuntimeSnapshot,
 ) {
     let mut state = state.lock().await;
-    state.serial_running = serial_running;
-    state.rtt_running = rtt_running;
-    state.route = route;
-    state.output_mode = output_mode;
-    state.timestamp = timestamp;
-    state.local_echo = local_echo;
-    state.output_paused = output_paused;
+    state.serial_running = snapshot.serial_running;
+    state.rtt_running = snapshot.rtt_running;
+    state.route = snapshot.route;
+    state.output_mode = snapshot.output_mode;
+    state.timestamp = snapshot.timestamp;
+    state.local_echo = snapshot.local_echo;
+    state.output_paused = snapshot.output_paused;
 }
 
 pub(crate) async fn collect_control_output(
@@ -63,18 +68,7 @@ pub(crate) async fn collect_control_raw_output(
     params: ControlRawReadParams,
     json: bool,
 ) -> String {
-    let response = collect_control_raw_read(
-        raw_rx,
-        history,
-        params.source,
-        params.timeout,
-        params.since,
-        params.until_hex.as_deref(),
-        params.max_bytes,
-        params.raw_hex,
-        params.raw_text,
-    )
-    .await;
+    let response = collect_control_raw_read(raw_rx, history, &params).await;
     if params.fail_on_timeout && response.timed_out {
         return control_error_response(json, control_timeout_error(params.until_hex.as_deref()));
     }
@@ -106,18 +100,7 @@ pub(crate) async fn collect_control_request_raw_output(
     meta: ControlRequestRawMeta,
     params: ControlRawReadParams,
 ) -> String {
-    let raw_response = collect_control_raw_read(
-        raw_rx,
-        history,
-        params.source,
-        params.timeout,
-        params.since,
-        params.until_hex.as_deref(),
-        params.max_bytes,
-        params.raw_hex,
-        params.raw_text,
-    )
-    .await;
+    let raw_response = collect_control_raw_read(raw_rx, history, &params).await;
     if params.fail_on_timeout && raw_response.timed_out {
         return control_error_response(true, control_timeout_error(params.until_hex.as_deref()));
     }
@@ -165,14 +148,12 @@ pub(crate) struct ControlRequestRawMeta {
 pub(crate) async fn collect_control_raw_read(
     raw_rx: &mut broadcast::Receiver<ControlOutput>,
     history: &Arc<Mutex<ControlHistory>>,
-    source: ControlSource,
-    timeout: Duration,
-    since: Option<u64>,
-    until: Option<&[u8]>,
-    max_bytes: Option<usize>,
-    raw_hex: bool,
-    raw_text: bool,
+    params: &ControlRawReadParams,
 ) -> ControlRawReadResponse {
+    let source = params.source;
+    let since = params.since;
+    let until = params.until_hex.as_deref();
+    let max_bytes = params.max_bytes;
     let snapshot = history.lock().await.snapshot(source, since);
     let mut next_expected_seq = snapshot.next_seq;
     let mut dropped_before = snapshot.dropped_before;
@@ -188,7 +169,7 @@ pub(crate) async fn collect_control_raw_read(
         limited = outcome.limited;
     }
     let mut timed_out = false;
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + params.timeout;
     loop {
         if matched_until_hex || limited {
             break;
@@ -273,9 +254,11 @@ pub(crate) async fn collect_control_raw_read(
         ok: true,
         source: source.as_ctl_str(),
         bytes: data.len(),
-        hex: raw_hex.then(|| encode_hex(&data)),
+        hex: params.raw_hex.then(|| encode_hex(&data)),
         text: decode_control_utf8(&data),
-        text_lossy: raw_text.then(|| String::from_utf8_lossy(&data).into_owned()),
+        text_lossy: params
+            .raw_text
+            .then(|| String::from_utf8_lossy(&data).into_owned()),
         cursor_unit: CONTROL_CURSOR_UNIT,
         next_seq,
         dropped_before,

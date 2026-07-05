@@ -1,9 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-#[cfg(feature = "control")]
-use clap::{Args, Subcommand};
-use clap::{Parser, ValueEnum};
-#[cfg(feature = "control")]
-use crossterm::cursor::{RestorePosition, SavePosition};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::MoveTo,
     event::{self, Event, KeyCode, KeyModifiers},
@@ -23,8 +19,6 @@ compile_error!("enable at least one transport feature: \"rtt\" or \"serial\"");
 #[cfg(all(feature = "control", not(any(feature = "rtt", feature = "serial"))))]
 compile_error!("feature \"control\" requires feature \"rtt\" or \"serial\"");
 
-#[cfg(all(feature = "rtt", feature = "control"))]
-use jlink_rs::FlashProgress as JLinkFlashProgress;
 #[cfg(feature = "rtt")]
 use jlink_rs::{
     default_library_candidates, AsyncJLink, ConnectSpeed, JLink, JLinkHost, JlinkResult,
@@ -49,8 +43,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-#[cfg(feature = "rtt")]
-use tokio::net::TcpStream;
+#[cfg(any(feature = "rtt", feature = "serial"))]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(any(feature = "control", feature = "rtt", feature = "serial"))]
+use tokio::sync::broadcast;
 #[cfg(feature = "control")]
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, BufReader},
@@ -63,8 +59,10 @@ use tokio::{
 #[cfg(feature = "control")]
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{broadcast, Semaphore},
+    sync::Semaphore,
 };
+#[cfg(all(feature = "serial", feature = "espflash"))]
+use tokio_serial::SerialPort;
 #[cfg(feature = "serial")]
 use tokio_serial::{FlowControl, SerialPortBuilderExt};
 
@@ -318,6 +316,7 @@ enum MenuCommand {
     Reconnect,
     Reset,
     Flash { path: PathBuf, addr: u32 },
+    Erase,
 }
 
 #[derive(Debug)]
@@ -329,17 +328,14 @@ enum InterfaceCommand {
     Reconnect {
         reply: Option<ControlReply>,
     },
-    #[cfg(feature = "rtt")]
     Reset {
         reply: Option<ControlReply>,
     },
-    #[cfg(feature = "rtt")]
     Flash {
         path: PathBuf,
         addr: u32,
         reply: Option<ControlReply>,
     },
-    #[cfg(all(feature = "rtt", feature = "control"))]
     Erase {
         reply: Option<ControlReply>,
     },
@@ -360,8 +356,8 @@ enum InterfaceEvent {
         source: Source,
         text: String,
     },
-    #[cfg(all(feature = "rtt", feature = "control"))]
-    FlashProgress(Option<JLinkFlashProgress>),
+    #[cfg(feature = "control")]
+    FlashProgress(Option<TerminalFlashProgress>),
     Stopped(Source),
 }
 
@@ -377,6 +373,8 @@ enum TerminalEvent {
     SetFlashProgress(Option<TerminalFlashProgress>),
     #[cfg(feature = "control")]
     Activity(Source),
+    #[cfg(feature = "control")]
+    Resize,
     ShowMenu(usize),
     ShowHelp,
     HideMenu,
@@ -393,9 +391,11 @@ struct TerminalUiState {
 }
 
 #[cfg(feature = "control")]
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct TerminalStatusBar {
     target: &'static str,
+    target_label: String,
     serial_running: bool,
     rtt_running: bool,
     output_mode: OutputMode,
@@ -406,7 +406,7 @@ struct TerminalStatusBar {
     history_max_bytes: usize,
 }
 
-#[cfg(feature = "control")]
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct TerminalFlashProgress {
     action: String,
@@ -570,6 +570,13 @@ struct RttioConfig {
     jlink_ip: Option<String>,
     device: Option<String>,
     recent_flash: Vec<PathBuf>,
+    recent_flash_addr: Vec<RecentFlashAddress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct RecentFlashAddress {
+    path: PathBuf,
+    addr: u32,
 }
 
 fn default_config_version() -> u32 {
@@ -587,6 +594,7 @@ impl Default for RttioConfig {
             jlink_ip: None,
             device: None,
             recent_flash: Vec::new(),
+            recent_flash_addr: Vec::new(),
         }
     }
 }
@@ -597,6 +605,9 @@ impl RttioConfig {
             self.version = CONFIG_VERSION;
         }
         self.recent_flash.truncate(10);
+        self.recent_flash_addr
+            .retain(|entry| self.recent_flash.iter().any(|path| path == &entry.path));
+        self.recent_flash_addr.truncate(10);
     }
 }
 
@@ -607,7 +618,7 @@ enum ConfigTarget {
     Rtt,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OutputLineState {
     serial: bool,
     rtt: bool,
@@ -632,6 +643,12 @@ impl OutputLineState {
     }
 }
 
+impl Default for OutputLineState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rttio",
@@ -639,35 +656,166 @@ impl OutputLineState {
     about = "tio-like terminal for serial ports and J-Link RTT"
 )]
 struct Opts {
-    #[cfg(feature = "control")]
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// J-Link target chip name. Can also be set with JLINK_CHIP.
-    #[cfg(feature = "rtt")]
-    #[arg(help_heading = "RTT / J-Link")]
-    target_chip: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 1024,
+        value_parser = parse_nonzero_usize,
+        help = "Transport read chunk size in bytes",
+        help_heading = "Terminal"
+    )]
+    chunk: usize,
 
-    /// Serial port path, for example /dev/tty.usbmodem101 or COM7.
-    #[cfg(feature = "serial")]
-    #[arg(short = 's', long, help_heading = "Serial")]
-    serial: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 10,
+        value_parser = parse_nonzero_u64,
+        help = "RTT/TCP poll interval in milliseconds",
+        help_heading = "Terminal"
+    )]
+    poll_ms: u64,
 
-    #[cfg(feature = "serial")]
-    #[arg(long, help = "Serial baud rate", help_heading = "Serial")]
-    baud: Option<u32>,
+    #[arg(long, global = true, value_enum, default_value_t = OutputMode::Normal, help = "Terminal output mode", help_heading = "Terminal")]
+    output_mode: OutputMode,
+
+    #[arg(long, global = true, value_enum, default_value_t = LineEnding::CrLf, help = "Line ending appended to typed lines", help_heading = "Terminal")]
+    line_ending: LineEnding,
+
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Prefix rendered output lines with local timestamps",
+        help_heading = "Terminal"
+    )]
+    timestamp: bool,
+
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Echo typed input locally",
+        help_heading = "Terminal"
+    )]
+    local_echo: bool,
+
+    #[arg(
+        long = "log",
+        global = true,
+        value_name = "FILE",
+        help = "Write rendered terminal output to file",
+        help_heading = "Logging"
+    )]
+    log_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Append to log file instead of truncating",
+        help_heading = "Logging"
+    )]
+    log_append: bool,
 
     #[cfg(feature = "serial")]
     #[arg(
         long,
-        value_enum,
-        default_value_t = SerialFlowControl::None,
-        help = "Serial flow control",
-        help_heading = "Serial"
+        global = true,
+        default_value_t = false,
+        help = "Disable automatic serial reconnect",
+        help_heading = "Reconnect"
     )]
-    serial_flow_control: SerialFlowControl,
+    no_reconnect: bool,
 
     #[cfg(feature = "rtt")]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Enable automatic RTT/J-Link reconnect after a successful connection drops",
+        help_heading = "Reconnect"
+    )]
+    rtt_reconnect: bool,
+
+    #[cfg(any(feature = "rtt", feature = "serial"))]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 1000,
+        help = "Reconnect delay in milliseconds",
+        help_heading = "Reconnect"
+    )]
+    reconnect_delay_ms: u64,
+
+    #[arg(
+        long = "no-config",
+        global = true,
+        default_value_t = false,
+        help = "Ignore .rttio for this run and do not update it",
+        help_heading = "Config"
+    )]
+    no_config: bool,
+
+    /// Unix socket path for the local control API.
+    #[cfg(feature = "control")]
+    #[arg(long, global = true, default_value = DEFAULT_CONTROL_SOCKET, help_heading = "Control")]
+    socket: PathBuf,
+}
+
+fn parse_nonzero_usize(input: &str) -> std::result::Result<usize, String> {
+    let value = input
+        .parse::<usize>()
+        .map_err(|e| format!("invalid positive integer {input:?}: {e}"))?;
+    if value == 0 {
+        Err("value must be greater than zero".to_string())
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_nonzero_u64(input: &str) -> std::result::Result<u64, String> {
+    let value = input
+        .parse::<u64>()
+        .map_err(|e| format!("invalid positive integer {input:?}: {e}"))?;
+    if value == 0 {
+        Err("value must be greater than zero".to_string())
+    } else {
+        Ok(value)
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    #[cfg(feature = "rtt")]
+    #[command(about = "Open a J-Link RTT terminal")]
+    Rtt(RttOpts),
+    #[cfg(feature = "serial")]
+    #[command(about = "Open a serial terminal")]
+    Serial(SerialOpts),
+    #[cfg(feature = "rtt")]
+    #[command(about = "List connected J-Link probes and exit")]
+    Probes(ProbesOpts),
+    #[cfg(feature = "rtt")]
+    #[command(about = "List SEGGER J-Link target devices and exit")]
+    Devices(DevicesOpts),
+    #[cfg(feature = "rtt")]
+    #[command(about = "Open SEGGER's native target-device picker and print the selected device")]
+    PickDevice(PickDeviceOpts),
+    #[cfg(feature = "control")]
+    #[command(about = "Control an already running rttio instance through its Unix socket")]
+    Ctl(CtlOpts),
+}
+
+#[cfg(feature = "rtt")]
+#[derive(Args, Debug)]
+struct RttOpts {
+    /// J-Link target chip name. Can also be set with JLINK_CHIP.
+    chip: Option<String>,
+
     #[arg(
         long,
         help = "J-Link probe serial number",
@@ -675,7 +823,6 @@ struct Opts {
     )]
     sn: Option<u32>,
 
-    #[cfg(feature = "rtt")]
     #[arg(
         long,
         help = "J-Link Remote Server address, optionally HOST:PORT",
@@ -683,7 +830,6 @@ struct Opts {
     )]
     jlink_ip: Option<String>,
 
-    #[cfg(feature = "rtt")]
     #[arg(
         long,
         help = "Explicit SEGGER J-Link shared library path",
@@ -691,7 +837,6 @@ struct Opts {
     )]
     jlink_lib: Option<PathBuf>,
 
-    #[cfg(feature = "rtt")]
     #[arg(
         long,
         default_value = "4000",
@@ -701,7 +846,6 @@ struct Opts {
     )]
     jlink_speed: ConnectSpeed,
 
-    #[cfg(feature = "rtt")]
     #[arg(
         long,
         help = "Configure the J-Link DLL RTT Telnet server port in direct J-Link mode",
@@ -709,7 +853,6 @@ struct Opts {
     )]
     jlink_rtt_port: Option<u16>,
 
-    #[cfg(feature = "rtt")]
     #[arg(
         long,
         default_value_t = 0,
@@ -718,7 +861,6 @@ struct Opts {
     )]
     rtt_up: u32,
 
-    #[cfg(feature = "rtt")]
     #[arg(
         long,
         default_value_t = 0,
@@ -727,7 +869,6 @@ struct Opts {
     )]
     rtt_down: u32,
 
-    #[cfg(feature = "rtt")]
     #[arg(
         long = "rtt-port",
         help = "Connect to an RTT stream server port instead of direct J-Link",
@@ -735,7 +876,6 @@ struct Opts {
     )]
     rtt_tcp_port: Option<u16>,
 
-    #[cfg(feature = "rtt")]
     #[arg(
         long = "rtt-host",
         default_value = "127.0.0.1",
@@ -746,123 +886,88 @@ struct Opts {
 
     #[arg(
         long,
-        default_value_t = 1024,
-        help = "Transport read chunk size in bytes",
-        help_heading = "Terminal"
+        value_name = "HOST:PORT",
+        help = "Serve the active RTT terminal as raw TCP serial-over-IP",
+        help_heading = "Network"
     )]
-    chunk: usize,
-
-    #[arg(
-        long,
-        default_value_t = 10,
-        help = "RTT/TCP poll interval in milliseconds",
-        help_heading = "Terminal"
-    )]
-    poll_ms: u64,
-
-    #[arg(long, value_enum, default_value_t = OutputMode::Normal, help = "Terminal output mode", help_heading = "Terminal")]
-    output_mode: OutputMode,
-
-    #[arg(long, value_enum, default_value_t = LineEnding::CrLf, help = "Line ending appended to typed lines", help_heading = "Terminal")]
-    line_ending: LineEnding,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Prefix rendered output lines with local timestamps",
-        help_heading = "Terminal"
-    )]
-    timestamp: bool,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Echo typed input locally",
-        help_heading = "Terminal"
-    )]
-    local_echo: bool,
-
-    #[arg(
-        long = "log",
-        value_name = "FILE",
-        help = "Write rendered terminal output to file",
-        help_heading = "Logging"
-    )]
-    log_file: Option<PathBuf>,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Append to log file instead of truncating",
-        help_heading = "Logging"
-    )]
-    log_append: bool,
-
-    #[cfg(any(feature = "rtt", feature = "serial"))]
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Disable automatic reconnect",
-        help_heading = "Reconnect"
-    )]
-    no_reconnect: bool,
-
-    #[cfg(any(feature = "rtt", feature = "serial"))]
-    #[arg(
-        long,
-        default_value_t = 1000,
-        help = "Reconnect delay in milliseconds",
-        help_heading = "Reconnect"
-    )]
-    reconnect_delay_ms: u64,
-
-    #[cfg(feature = "rtt")]
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "List connected J-Link probes and exit",
-        help_heading = "RTT / J-Link"
-    )]
-    list: bool,
-
-    #[cfg(feature = "rtt")]
-    #[arg(
-        long,
-        value_name = "FILTER",
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = "List SEGGER J-Link target devices, optionally filtered by name/manufacturer",
-        help_heading = "RTT / J-Link"
-    )]
-    devices: Option<String>,
-
-    #[cfg(feature = "rtt")]
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Open SEGGER's native target-device picker and use the selected device for RTT",
-        help_heading = "RTT / J-Link"
-    )]
-    pick_device: bool,
-
-    /// Unix socket path for the local control API.
-    #[cfg(feature = "control")]
-    #[arg(long, default_value = DEFAULT_CONTROL_SOCKET, help_heading = "Control")]
-    socket: PathBuf,
+    serve: Option<String>,
 }
 
-#[cfg(feature = "control")]
-#[derive(Subcommand, Debug)]
-enum Command {
-    #[command(about = "Control an already running rttio instance through its Unix socket")]
-    Ctl(CtlOpts),
+#[cfg(feature = "serial")]
+#[derive(Args, Debug)]
+struct SerialOpts {
+    /// Serial port path or raw TCP endpoint, for example /dev/ttyUSB0, COM7, or tcp://host:3001.
+    port: PathBuf,
+
+    #[arg(long, help = "Serial baud rate", help_heading = "Serial")]
+    baud: Option<u32>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SerialFlowControl::None,
+        help = "Serial flow control",
+        help_heading = "Serial"
+    )]
+    flow_control: SerialFlowControl,
+
+    #[cfg(feature = "espflash")]
+    #[arg(
+        long,
+        value_parser = parse_esp_chip,
+        help = "ESP chip for serial flashing, for example esp32s3; omitted = autodetect",
+        help_heading = "Serial / ESP"
+    )]
+    esp_chip: Option<::espflash::target::Chip>,
+
+    #[cfg(feature = "espflash")]
+    #[arg(
+        long,
+        default_value_t = 921_600,
+        help = "ESP flashing baud rate",
+        help_heading = "Serial / ESP"
+    )]
+    espflash_baud: u32,
+
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        help = "Serve the active serial terminal as raw TCP serial-over-IP",
+        help_heading = "Network"
+    )]
+    serve: Option<String>,
+}
+
+#[cfg(feature = "rtt")]
+#[derive(Args, Debug)]
+struct ProbesOpts {
+    #[arg(long, help = "Explicit SEGGER J-Link shared library path")]
+    jlink_lib: Option<PathBuf>,
+    #[arg(long, help = "Only show this J-Link probe serial number")]
+    sn: Option<u32>,
+}
+
+#[cfg(feature = "rtt")]
+#[derive(Args, Debug)]
+struct DevicesOpts {
+    #[arg(help = "Optional target name/manufacturer filter")]
+    filter: Option<String>,
+    #[arg(long, help = "Explicit SEGGER J-Link shared library path")]
+    jlink_lib: Option<PathBuf>,
+}
+
+#[cfg(feature = "rtt")]
+#[derive(Args, Debug)]
+struct PickDeviceOpts {
+    #[arg(long, help = "Explicit SEGGER J-Link shared library path")]
+    jlink_lib: Option<PathBuf>,
 }
 
 #[cfg(feature = "control")]
 #[derive(Args, Debug)]
 #[command(
     long_about = "Control an already running rttio process through its local Unix socket.\n\nThe interactive rttio process owns the serial/RTT target and creates .rttio-sock. A second rttio process can use `rttio ctl ...` to inspect status, write bytes, read buffered output, clear the read buffer, perform request/response exchanges, flash, reset, erase, reconnect, or stop the running process.\n\nPayload rule: commands that send text or hex accept payload after `--`. Use `--hex` on write/request when the payload is hexadecimal bytes. Read cursors are byte sequence numbers returned as `next_seq` in JSON responses.",
-    after_long_help = "Command reference:\n  version [--json]                        rttio binary version, git hash, and protocol version.\n  status [--json]                         Runtime state and selected target.\n  commands [--json]                       Machine-readable protocol metadata.\n  clear-buffer [--json]                   Drop buffered output history.\n  read [--raw-hex] [--raw-text] [...]     Read buffered output from the active transport.\n  follow                                  Stream rendered terminal output.\n  write [--target current|serial|rtt] [--hex] [--json] -- <payload>\n                                          Write text or hex bytes.\n  writeln [--target current|serial|rtt] [--json] -- <text>\n                                          Write text plus configured line ending.\n  request [--target ...] [--raw-hex] [--raw-text] [--until-hex HEX] [--hex] [--json] -- <payload>\n                                          Write, then read the response from the active transport.\n  reset [--json]                          Reset target through direct J-Link RTT.\n  reconnect [--json]                      Reconnect active transport.\n  flash [--json] [--timeout MS] <file> [addr]\n                                          Flash hex/bin/elf through direct J-Link RTT.\n  erase [--json]                          Erase chip through direct J-Link RTT.\n  quit [--json]                           Stop running rttio.\n\nExamples:\n  rttio ctl version --json\n  rttio ctl status --json\n  rttio ctl commands --json\n  rttio ctl clear-buffer --json\n  rttio ctl read --timeout 200 --json\n  rttio ctl read --raw-hex --raw-text --timeout 200 --json\n  rttio ctl follow\n  rttio ctl write --target current -- \"AT+CFUN?\"\n  rttio ctl write --target rtt --hex -- 41 54 0d 0a\n  rttio ctl request --target rtt --timeout 1000 --until-hex 0d0a --json -- \"AT\"\n  rttio ctl request --target serial --hex --raw-hex --json -- 41 54 0d 0a\n  rttio ctl reset --json\n  rttio ctl flash --json --timeout 120000 build/app.hex 0x0\n  rttio ctl erase --json\n  rttio ctl quit\n\nSocket discovery:\n  By default ctl walks upward from the current directory looking for .rttio-sock.\n  Use --socket PATH to address a specific running instance.\n\nJSON contract:\n  Success responses contain ok=true. Error responses contain ok=false, code, and error.\n  read/request JSON responses include next_seq; pass that value back with --since.\n"
+    after_long_help = "Command reference:\n  version [--json]                        rttio binary version, git hash, and protocol version.\n  status [--json]                         Runtime state and selected target.\n  commands [--json]                       Machine-readable protocol metadata.\n  clear-buffer [--json]                   Drop buffered output history.\n  read [--raw-hex] [--raw-text] [...]     Read buffered output from the active transport.\n  follow                                  Stream rendered terminal output.\n  write [--target current|serial|rtt] [--hex] [--json] -- <payload>\n                                          Write text or hex bytes.\n  writeln [--target current|serial|rtt] [--json] -- <text>\n                                          Write text plus configured line ending.\n  request [--target ...] [--raw-hex] [--raw-text] [--until-hex HEX] [--hex] [--json] -- <payload>\n                                          Write, then read the response from the active transport.\n  reset [--json]                          Reset target through the active transport flasher.\n  reconnect [--json]                      Reconnect active transport.\n  flash [--json] [--timeout MS] <file> [addr]\n                                          Flash through the active transport: J-Link RTT or ESP serial.\n  erase [--json]                          Erase through the active transport flasher.\n  quit [--json]                           Stop running rttio.\n\nExamples:\n  rttio ctl version --json\n  rttio ctl status --json\n  rttio ctl commands --json\n  rttio ctl clear-buffer --json\n  rttio ctl read --timeout 200 --json\n  rttio ctl read --raw-hex --raw-text --timeout 200 --json\n  rttio ctl follow\n  rttio ctl write --target current -- \"AT+CFUN?\"\n  rttio ctl write --target rtt --hex -- 41 54 0d 0a\n  rttio ctl request --target rtt --timeout 1000 --until-hex 0d0a --json -- \"AT\"\n  rttio ctl request --target serial --hex --raw-hex --json -- 41 54 0d 0a\n  rttio ctl reset --json\n  rttio ctl flash --json --timeout 120000 build/app.hex 0x0\n  rttio ctl erase --json\n  rttio ctl quit\n\nSocket discovery:\n  By default ctl walks upward from the current directory looking for .rttio-sock.\n  Use --socket PATH to address a specific running instance.\n\nJSON contract:\n  Success responses contain ok=true. Error responses contain ok=false, code, and error.\n  read/request JSON responses include next_seq; pass that value back with --since.\n"
 )]
 struct CtlOpts {
     #[arg(
@@ -1015,7 +1120,7 @@ enum CtlCommand {
         #[arg(help = "Request payload words; use -- before payload that starts with '-'")]
         text: Vec<String>,
     },
-    #[command(about = "Reset target through direct J-Link RTT mode")]
+    #[command(about = "Reset target through the active transport flasher")]
     Reset {
         #[arg(long, default_value_t = false, help = "Print JSON action result")]
         json: bool,
@@ -1029,7 +1134,7 @@ enum CtlCommand {
         #[arg(long, default_value_t = CONTROL_ACTION_TIMEOUT_MS, help = "Action timeout in milliseconds")]
         timeout: u64,
     },
-    #[command(about = "Flash hex/bin/elf through direct J-Link RTT mode")]
+    #[command(about = "Flash through the active transport: J-Link RTT or ESP serial")]
     Flash {
         #[arg(long, default_value_t = false, help = "Print JSON flash result")]
         json: bool,
@@ -1040,7 +1145,7 @@ enum CtlCommand {
         #[arg(long, default_value_t = CONTROL_FLASH_TIMEOUT_MS, help = "Flash timeout in milliseconds")]
         timeout: u64,
     },
-    #[command(about = "Erase chip through direct J-Link RTT mode")]
+    #[command(about = "Erase through the active transport flasher")]
     Erase {
         #[arg(long, default_value_t = false, help = "Print JSON action result")]
         json: bool,
@@ -1077,6 +1182,8 @@ mod app;
 mod config;
 #[cfg(feature = "control")]
 mod control;
+#[cfg(feature = "espflash")]
+mod espflash;
 mod input_menu;
 mod runtime;
 mod terminal;
@@ -1086,6 +1193,8 @@ use app::*;
 use config::*;
 #[cfg(feature = "control")]
 use control::*;
+#[cfg(feature = "espflash")]
+use espflash::*;
 use input_menu::*;
 use runtime::*;
 use terminal::*;

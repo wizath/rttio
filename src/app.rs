@@ -1,6 +1,7 @@
 use crate::*;
 
 #[cfg(feature = "rtt")]
+#[cfg(test)]
 pub(crate) fn select_jlink_sn(
     serial_requested: bool,
     explicit_jlink_ip: bool,
@@ -16,25 +17,8 @@ pub(crate) fn select_jlink_sn(
 }
 
 pub(crate) async fn run_app(opts: Opts) -> Result<()> {
-    let config = match load_config() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("[rttio] failed to load {CONFIG_FILE}: {e}");
-            RttioConfig::default()
-        }
-    };
-
-    #[cfg(feature = "rtt")]
-    if opts.list {
-        list_jlinks(opts.jlink_lib, opts.sn)?;
-        return Ok(());
-    }
-
-    #[cfg(feature = "rtt")]
-    if let Some(filter) = &opts.devices {
-        list_jlink_devices(opts.jlink_lib, filter)?;
-        return Ok(());
-    }
+    init_timestamp_epoch();
+    set_config_updates_disabled(opts.no_config);
 
     #[cfg(feature = "control")]
     if let Some(Command::Ctl(ctl)) = &opts.command {
@@ -58,50 +42,85 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     }
 
     #[cfg(feature = "rtt")]
-    let env_chip = std::env::var("JLINK_CHIP").ok();
-    #[cfg(all(feature = "serial", feature = "rtt"))]
-    let serial_requested = opts.serial.is_some();
-    #[cfg(all(feature = "rtt", not(feature = "serial")))]
-    let serial_requested = false;
-    #[cfg(all(feature = "serial", feature = "rtt"))]
-    if serial_requested && opts.pick_device {
-        return Err(anyhow!(
-            "--pick-device selects an RTT target; do not combine it with --serial"
-        ));
+    if let Some(Command::Probes(probes)) = &opts.command {
+        list_jlinks(probes.jlink_lib.clone(), probes.sn)?;
+        return Ok(());
     }
+
     #[cfg(feature = "rtt")]
-    let rtt_requested = opts.target_chip.is_some()
-        || opts.rtt_tcp_port.is_some()
-        || opts.sn.is_some()
-        || opts.jlink_ip.is_some()
-        || opts.jlink_lib.is_some()
-        || opts.pick_device;
-    #[cfg(not(feature = "rtt"))]
-    let rtt_requested = false;
+    if let Some(Command::Devices(devices)) = &opts.command {
+        list_jlink_devices(
+            devices.jlink_lib.clone(),
+            devices.filter.as_deref().unwrap_or(""),
+        )?;
+        return Ok(());
+    }
+
     #[cfg(feature = "rtt")]
-    let picked_chip = if opts.pick_device && !serial_requested {
-        Some(pick_jlink_device(opts.jlink_lib.clone())?)
+    if let Some(Command::PickDevice(pick)) = &opts.command {
+        println!("{}", pick_jlink_device(pick.jlink_lib.clone())?);
+        return Ok(());
+    }
+
+    let command = opts.command.as_ref().ok_or_else(|| {
+        anyhow!("choose a transport command: rttio rtt <chip> or rttio serial <port>")
+    })?;
+
+    let mut startup_logs = Vec::new();
+    let config_file_present = Path::new(CONFIG_FILE).exists();
+    let config = if opts.no_config {
+        startup_logs.push(format!("--no-config: ignoring {CONFIG_FILE}"));
+        RttioConfig::default()
     } else {
-        None
+        match load_config() {
+            Ok(config) => {
+                if config_file_present {
+                    startup_logs.push(format!("loaded config from {CONFIG_FILE}"));
+                } else {
+                    startup_logs.push(format!("no {CONFIG_FILE}; using defaults"));
+                }
+                config
+            }
+            Err(e) => {
+                startup_logs.push(format!("failed to load {CONFIG_FILE}: {e}"));
+                RttioConfig::default()
+            }
+        }
     };
-    #[cfg(all(feature = "serial", feature = "rtt"))]
-    let config_prefers_serial = !rtt_requested
-        && (config.target == Some(ConfigTarget::Serial)
-            || (config.target.is_none() && config.device.is_none()));
-    #[cfg(all(feature = "rtt", not(feature = "serial")))]
-    let config_prefers_serial = false;
+
+    #[cfg(feature = "serial")]
+    #[allow(unreachable_patterns)]
+    let serial_cmd = match command {
+        Command::Serial(serial) => Some(serial),
+        _ => None,
+    };
+
     #[cfg(feature = "rtt")]
-    let (target_chip, target_chip_source) = if serial_requested || config_prefers_serial {
-        (None, None)
-    } else if let Some(chip) = opts.target_chip.clone() {
-        (Some(chip), Some("argv"))
-    } else if let Some(chip) = picked_chip {
-        (Some(chip), Some("SEGGER device picker"))
-    } else if let Some(chip) = env_chip.clone() {
-        (Some(chip), Some("JLINK_CHIP"))
-    } else if !rtt_requested {
-        if let Some(chip) = config.device.clone() {
-            (Some(chip), Some(CONFIG_FILE))
+    let rtt_cmd = match command {
+        Command::Rtt(rtt) => Some(rtt),
+        _ => None,
+    };
+
+    #[cfg(any(feature = "serial", feature = "rtt"))]
+    #[allow(unreachable_patterns)]
+    let serve_addr = match command {
+        #[cfg(feature = "serial")]
+        Command::Serial(serial) => serial.serve.clone(),
+        #[cfg(feature = "rtt")]
+        Command::Rtt(rtt) => rtt.serve.clone(),
+        _ => None,
+    };
+
+    #[cfg(feature = "rtt")]
+    let env_chip = std::env::var("JLINK_CHIP").ok();
+    #[cfg(feature = "rtt")]
+    let (target_chip, target_chip_source) = if let Some(rtt) = rtt_cmd {
+        if let Some(chip) = rtt.chip.clone() {
+            (Some(chip), Some("argv"))
+        } else if let Some(chip) = env_chip.clone() {
+            (Some(chip), Some("JLINK_CHIP"))
+        } else if rtt.rtt_tcp_port.is_none() {
+            return Err(anyhow!("missing RTT target chip: use rttio rtt <chip>, set JLINK_CHIP, or pass --rtt-port for an RTT stream"));
         } else {
             (None, None)
         }
@@ -110,90 +129,112 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     };
     #[cfg(not(feature = "rtt"))]
     let (target_chip, target_chip_source): (Option<String>, Option<&str>) = (None, None);
+
     #[cfg(feature = "serial")]
-    let serial_path = if rtt_requested || target_chip.is_some() {
-        None
-    } else if let Some(serial) = opts.serial.clone() {
-        Some(serial)
-    } else {
-        config.serial.clone()
-    };
+    let serial_path = serial_cmd.map(|serial| serial.port.clone());
     #[cfg(not(feature = "serial"))]
     let serial_path: Option<PathBuf> = None;
+
     #[cfg(feature = "serial")]
-    let baud = opts.baud.or(config.baud).unwrap_or(115200);
+    let (baud, baud_source) = if let Some(serial) = serial_cmd {
+        if let Some(baud) = serial.baud {
+            (baud, "argv")
+        } else if let Some(baud) = config.baud {
+            (baud, CONFIG_FILE)
+        } else {
+            (115200, "default")
+        }
+    } else {
+        (115200, "default")
+    };
     #[cfg(not(feature = "serial"))]
     let baud = 115200;
+    #[cfg(not(feature = "serial"))]
+    let _baud_source = "default";
+
     #[cfg(feature = "rtt")]
     let env_sn = env_jlink_sn();
     #[cfg(feature = "rtt")]
-    let mut jlink_sn = select_jlink_sn(
-        serial_requested,
-        opts.jlink_ip.is_some(),
-        opts.sn,
-        env_sn,
-        config.jlink_sn,
-    );
+    let (mut jlink_sn, mut jlink_sn_source) = if let Some(rtt) = rtt_cmd {
+        if rtt.jlink_ip.is_some() {
+            (None, None)
+        } else if let Some(sn) = rtt.sn {
+            (Some(sn), Some("argv"))
+        } else if let Some(sn) = env_sn {
+            (Some(sn), Some("JLINK_SN"))
+        } else if let Some(sn) = config.jlink_sn {
+            (Some(sn), Some(CONFIG_FILE))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
     #[cfg(not(feature = "rtt"))]
     let jlink_sn: Option<u32> = None;
+    #[cfg(not(feature = "rtt"))]
+    let _jlink_sn_source: Option<&str> = None;
+
     #[cfg(feature = "rtt")]
-    let jlink_ip = if serial_requested {
-        None
+    let (jlink_ip, jlink_ip_source) = if let Some(rtt) = rtt_cmd {
+        if let Some(ip) = rtt.jlink_ip.clone() {
+            (Some(ip), Some("argv"))
+        } else if let Some(ip) = config.jlink_ip.clone() {
+            (Some(ip), Some(CONFIG_FILE))
+        } else {
+            (None, None)
+        }
     } else {
-        opts.jlink_ip.clone().or(config.jlink_ip.clone())
+        (None, None)
     };
     #[cfg(not(feature = "rtt"))]
     let jlink_ip: Option<String> = None;
-    #[cfg(feature = "rtt")]
-    let rtt_tcp_port = if serial_requested {
-        None
-    } else {
-        opts.rtt_tcp_port
-    };
     #[cfg(not(feature = "rtt"))]
+    let _jlink_ip_source: Option<&str> = None;
+
+    #[cfg(feature = "rtt")]
+    let rtt_tcp_port = rtt_cmd.and_then(|rtt| rtt.rtt_tcp_port);
+    #[cfg(not(feature = "rtt"))]
+    #[cfg_attr(not(feature = "control"), allow(unused_variables))]
     let rtt_tcp_port: Option<u16> = None;
 
-    if serial_path.is_none() && target_chip.is_none() && rtt_tcp_port.is_none() {
-        return Err(anyhow!(
-            "nothing to connect: pass --serial <port>, --rtt-port <port>, a J-Link target chip, or JLINK_CHIP"
-        ));
-    }
-    if serial_path.is_some() && (target_chip.is_some() || rtt_tcp_port.is_some()) {
-        return Err(anyhow!(
-            "choose exactly one transport: pass serial or RTT, not both"
-        ));
-    }
     #[cfg(feature = "rtt")]
     if target_chip.is_some() && jlink_sn.is_none() && jlink_ip.is_none() && rtt_tcp_port.is_none() {
-        match pick_default_jlink_sn(opts.jlink_lib.clone()) {
+        let jlink_lib = rtt_cmd.and_then(|rtt| rtt.jlink_lib.clone());
+        match pick_default_jlink_sn(jlink_lib) {
             Ok(Some(sn)) => {
-                eprintln!("[rttio] using first J-Link SN: {sn}");
+                startup_logs.push(format!("using first J-Link SN: {sn}"));
                 jlink_sn = Some(sn);
+                jlink_sn_source = Some("first J-Link");
             }
             Ok(None) => {}
-            Err(e) => eprintln!("[rttio] failed to list J-Link probes for SN: {e}"),
+            Err(e) => startup_logs.push(format!("failed to list J-Link probes for SN: {e}")),
         }
     }
 
     if let (Some(device), Some(source)) = (&target_chip, target_chip_source) {
-        eprintln!("[rttio] using device from {source}: {device}");
+        startup_logs.push(format!("using device from {source}: {device}"));
+    }
+    #[cfg(feature = "rtt")]
+    if let (Some(ip), Some(source)) = (&jlink_ip, jlink_ip_source) {
+        startup_logs.push(format!("using J-Link IP from {source}: {ip}"));
+    }
+    #[cfg(feature = "rtt")]
+    if let Some(sn) = jlink_sn {
+        let source = jlink_sn_source.unwrap_or("unknown");
+        startup_logs.push(format!("using J-Link SN from {source}: {sn}"));
     }
     #[cfg(feature = "serial")]
-    if opts.serial.is_none() {
-        if let Some(serial) = &serial_path {
-            eprintln!(
-                "[rttio] using serial from {CONFIG_FILE}: {}",
-                serial.display()
-            );
-        }
+    if let Some(serial) = &serial_path {
+        startup_logs.push(format!("using serial from argv: {}", serial.display()));
     }
     #[cfg(feature = "serial")]
-    if opts.baud.is_none() {
-        eprintln!("[rttio] using baud from {CONFIG_FILE}/default: {baud}");
+    if serial_cmd.and_then(|serial| serial.baud).is_none() {
+        startup_logs.push(format!("using baud from {baud_source}: {baud}"));
     }
     let mut persisted_config = config;
-    let mut serial_config_saved = false;
-    let mut rtt_config_saved = false;
+    let mut serial_config_saved = opts.no_config;
+    let mut rtt_config_saved = opts.no_config;
 
     let mut log_writer = if let Some(path) = &opts.log_file {
         LogWriter::open(path, opts.log_append)?
@@ -208,6 +249,8 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     let (control_output_tx, _) = broadcast::channel::<String>(512);
     #[cfg(feature = "control")]
     let (control_raw_tx, _) = broadcast::channel::<ControlOutput>(512);
+    #[cfg(any(feature = "serial", feature = "rtt"))]
+    let (serve_raw_tx, _) = broadcast::channel::<Vec<u8>>(512);
     #[cfg(feature = "control")]
     let control_history = Arc::new(Mutex::new(ControlHistory::new(CONTROL_HISTORY_MAX_BYTES)));
     let line_ending = opts.line_ending;
@@ -218,7 +261,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     let control_rtt_tcp_host = {
         #[cfg(feature = "rtt")]
         {
-            rtt_tcp_port.map(|_| opts.rtt_tcp_host.clone())
+            rtt_tcp_port.and_then(|_| rtt_cmd.map(|rtt| rtt.rtt_tcp_host.clone()))
         }
         #[cfg(not(feature = "rtt"))]
         {
@@ -228,6 +271,9 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
 
     let _terminal = TerminalGuard::enter()?;
     let terminal_join = tokio::spawn(terminal_task(terminal_rx));
+    for log in startup_logs {
+        terminal_status(&terminal_tx, &log).await;
+    }
     terminal_status(
         &terminal_tx,
         "rttio started. Ctrl-T q exits. Ctrl-T opens menu.",
@@ -236,18 +282,37 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
 
     let mut background_tasks = Vec::new();
 
+    #[cfg(any(feature = "serial", feature = "rtt"))]
+    if let Some(addr) = serve_addr {
+        let serve_join = tokio::spawn(raw_tcp_bridge_server(
+            addr,
+            input_tx.clone(),
+            serve_raw_tx.subscribe(),
+            terminal_tx.clone(),
+        ));
+        background_tasks.push(("serve", serve_join));
+    }
+
     #[cfg(feature = "serial")]
     let mut serial_tx = None;
     #[cfg(not(feature = "serial"))]
     let serial_tx: Option<mpsc::Sender<InterfaceCommand>> = None;
     #[cfg(feature = "serial")]
     if let Some(path) = serial_path {
+        let serial = serial_cmd.expect("serial command exists when serial path is set");
         let (tx, rx) = mpsc::channel::<InterfaceCommand>(128);
         serial_tx = Some(tx);
         let serial_join = tokio::spawn(serial_task(
-            path,
-            baud,
-            opts.serial_flow_control,
+            SerialTaskConfig {
+                path,
+                baud,
+                flow_control: serial.flow_control,
+                #[cfg(feature = "espflash")]
+                espflash: EspFlashConfig {
+                    chip: serial.esp_chip,
+                    baud: serial.espflash_baud,
+                },
+            },
             rx,
             event_tx.clone(),
             opts.no_reconnect,
@@ -262,14 +327,15 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     let rtt_tx: Option<mpsc::Sender<InterfaceCommand>> = None;
     #[cfg(feature = "rtt")]
     if let Some(port) = rtt_tcp_port {
+        let rtt = rtt_cmd.expect("rtt command exists when RTT TCP port is set");
         let (tx, rx) = mpsc::channel::<InterfaceCommand>(128);
         rtt_tx = Some(tx);
         let rtt_tcp_join = tokio::spawn(rtt_tcp_task(
-            opts.rtt_tcp_host.clone(),
+            rtt.rtt_tcp_host.clone(),
             port,
             rx,
             event_tx.clone(),
-            opts.no_reconnect,
+            !opts.rtt_reconnect,
             Duration::from_millis(opts.reconnect_delay_ms),
         ));
         background_tasks.push(("rtt tcp", rtt_tcp_join));
@@ -280,14 +346,16 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
             chip,
             jlink_sn,
             jlink_ip.clone(),
-            opts.jlink_lib.clone(),
-            opts.jlink_speed,
-            opts.jlink_rtt_port,
-            opts.rtt_up,
-            opts.rtt_down,
+            rtt_cmd.and_then(|rtt| rtt.jlink_lib.clone()),
+            rtt_cmd
+                .map(|rtt| rtt.jlink_speed)
+                .unwrap_or(ConnectSpeed::Khz(4000)),
+            rtt_cmd.and_then(|rtt| rtt.jlink_rtt_port),
+            rtt_cmd.map(|rtt| rtt.rtt_up).unwrap_or(0),
+            rtt_cmd.map(|rtt| rtt.rtt_down).unwrap_or(0),
             opts.chunk,
             opts.poll_ms,
-            opts.no_reconnect,
+            !opts.rtt_reconnect,
             Duration::from_millis(opts.reconnect_delay_ms),
             rx,
             event_tx.clone(),
@@ -299,7 +367,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     let input_task = spawn_input_task(
         input_tx.clone(),
         terminal_tx.clone(),
-        rtt_tx.is_some(),
+        rtt_tx.is_some() || serial_target_actions_available(serial_tx.is_some()),
         Arc::clone(&command_view_active),
     );
 
@@ -316,15 +384,17 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     let mut rtt_task_active = rtt_configured;
     let mut serial_running = false;
     let mut rtt_running = false;
-    let _ = terminal_tx
-        .send(TerminalEvent::SetUiState(TerminalUiState {
-            output_mode,
-            timestamp,
-            local_echo,
-            output_paused,
-            jlink_actions: rtt_tx.is_some(),
-        }))
-        .await;
+    let mut any_transport_connected = false;
+    let mut last_transport_error: Option<String> = None;
+    #[cfg(feature = "control")]
+    let mut last_status_bar_update = Instant::now();
+    let _ = terminal_tx.try_send(TerminalEvent::SetUiState(TerminalUiState {
+        output_mode,
+        timestamp,
+        local_echo,
+        output_paused,
+        jlink_actions: rtt_tx.is_some() || serial_target_actions_available(serial_tx.is_some()),
+    }));
     #[cfg(feature = "control")]
     let control_state = Arc::new(Mutex::new(ControlRuntimeState {
         control_socket: opts.socket.clone(),
@@ -340,7 +410,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
         rtt_up: {
             #[cfg(feature = "rtt")]
             {
-                opts.rtt_up
+                rtt_cmd.map(|rtt| rtt.rtt_up).unwrap_or(0)
             }
             #[cfg(not(feature = "rtt"))]
             {
@@ -350,7 +420,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
         rtt_down: {
             #[cfg(feature = "rtt")]
             {
-                opts.rtt_down
+                rtt_cmd.map(|rtt| rtt.rtt_down).unwrap_or(0)
             }
             #[cfg(not(feature = "rtt"))]
             {
@@ -385,26 +455,34 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     send_status_bar(
         &terminal_tx,
         build_status_bar(
-            route,
-            serial_running,
-            rtt_running,
-            output_mode,
-            timestamp,
-            local_echo,
-            output_paused,
+            app_runtime_snapshot(
+                route,
+                serial_running,
+                rtt_running,
+                output_mode,
+                timestamp,
+                local_echo,
+                output_paused,
+            ),
             0,
+            status_target_label(
+                route,
+                configured_serial_path.as_deref(),
+                configured_device.as_deref(),
+            ),
         ),
     )
     .await;
 
     loop {
         tokio::select! {
+            biased;
             Some(input) = input_rx.recv() => {
                 match input {
                     InputEvent::Bytes(bytes) => {
                         route_write(route, &bytes, &serial_tx, &rtt_tx).await;
                         #[cfg(feature = "control")]
-                        let _ = terminal_tx.send(TerminalEvent::Activity(Source::Tx)).await;
+                        let _ = terminal_tx.try_send(TerminalEvent::Activity(Source::Tx));
                         if local_echo {
                             let rendered = render_data(
                                 Source::Tx,
@@ -415,7 +493,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                                 &mut output_line_state,
                             );
                             if terminal_output_enabled(output_paused, &command_view_active) {
-                                let _ = terminal_tx.send(TerminalEvent::Output(rendered.clone())).await;
+                                let _ = terminal_tx.try_send(TerminalEvent::Output(rendered.clone()));
                             }
                             log_writer.write_record(&terminal_tx, &rendered);
                         }
@@ -425,7 +503,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                         payload.extend_from_slice(line_ending.bytes());
                         route_write(route, &payload, &serial_tx, &rtt_tx).await;
                         #[cfg(feature = "control")]
-                        let _ = terminal_tx.send(TerminalEvent::Activity(Source::Tx)).await;
+                        let _ = terminal_tx.try_send(TerminalEvent::Activity(Source::Tx));
                         if local_echo {
                             let rendered = render_data(
                                 Source::Tx,
@@ -436,7 +514,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                                 &mut output_line_state,
                             );
                             if terminal_output_enabled(output_paused, &command_view_active) {
-                                let _ = terminal_tx.send(TerminalEvent::Output(rendered.clone())).await;
+                                let _ = terminal_tx.try_send(TerminalEvent::Output(rendered.clone()));
                             }
                             log_writer.write_record(&terminal_tx, &rendered);
                         }
@@ -457,37 +535,37 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                             },
                         ).await;
                         #[cfg(feature = "control")]
-                        update_control_runtime_state(
-                            &control_state,
+                        let snapshot = app_runtime_snapshot(
+                            route,
                             serial_running,
                             rtt_running,
-                            route,
                             output_mode,
                             timestamp,
                             local_echo,
                             output_paused,
-                        ).await;
+                        );
+                        #[cfg(feature = "control")]
+                        update_control_runtime_state(&control_state, snapshot.control()).await;
                         let _ = terminal_tx
-                            .send(TerminalEvent::SetUiState(TerminalUiState {
+                            .try_send(TerminalEvent::SetUiState(TerminalUiState {
                                 output_mode,
                                 timestamp,
                                 local_echo,
                                 output_paused,
-                                jlink_actions: rtt_tx.is_some(),
-                            }))
-                            .await;
+                                jlink_actions: rtt_tx.is_some()
+                                    || serial_target_actions_available(serial_tx.is_some()),
+                            }));
                         #[cfg(feature = "control")]
                         send_status_bar(
                             &terminal_tx,
                             build_status_bar(
-                                route,
-                                serial_running,
-                                rtt_running,
-                                output_mode,
-                                timestamp,
-                                local_echo,
-                                output_paused,
+                                snapshot,
                                 control_history_bytes(&control_history).await,
+                                status_target_label(
+                                    route,
+                                    configured_serial_path.as_deref(),
+                                    configured_device.as_deref(),
+                                ),
                             ),
                         ).await;
                     }
@@ -506,7 +584,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                                 let write_ok = response.trim_start().starts_with("OK");
                                 let _ = reply.send(response);
                                 if write_ok {
-                                    let _ = terminal_tx.send(TerminalEvent::Activity(Source::Tx)).await;
+                                    let _ = terminal_tx.try_send(TerminalEvent::Activity(Source::Tx));
                                     let rendered = render_data(
                                         Source::Tx,
                                         &bytes,
@@ -517,8 +595,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                                     );
                                     if terminal_output_enabled(output_paused, &command_view_active) {
                                         let _ = terminal_tx
-                                            .send(TerminalEvent::Output(rendered.clone()))
-                                            .await;
+                                            .try_send(TerminalEvent::Output(rendered.clone()));
                                     }
                                     log_writer.write_record(&terminal_tx, &rendered);
                                     let _ = control_output_tx.send(rendered);
@@ -541,7 +618,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                 match event {
                     InterfaceEvent::Data { source, data } => {
                         #[cfg(feature = "control")]
-                        let _ = terminal_tx.send(TerminalEvent::Activity(source)).await;
+                        let _ = terminal_tx.try_send(TerminalEvent::Activity(source));
                         let rendered = render_data(
                             source,
                             &data,
@@ -562,44 +639,55 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                             source,
                             data: data.clone(),
                         });
+                        #[cfg(any(feature = "serial", feature = "rtt"))]
+                        let _ = serve_raw_tx.send(data.clone());
                         if terminal_output_enabled(output_paused, &command_view_active) {
-                            let _ = terminal_tx.send(TerminalEvent::Output(rendered.clone())).await;
+                            let _ = terminal_tx.try_send(TerminalEvent::Output(rendered.clone()));
                         }
                         log_writer.write_record(&terminal_tx, &rendered);
                         #[cfg(feature = "control")]
                         let _ = control_output_tx.send(rendered);
                         #[cfg(feature = "control")]
-                        send_status_bar(
-                            &terminal_tx,
-                            build_status_bar(
-                                route,
-                                serial_running,
-                                rtt_running,
-                                output_mode,
-                                timestamp,
-                                local_echo,
-                                output_paused,
-                                history_bytes,
-                            ),
-                        ).await;
+                        if last_status_bar_update.elapsed() >= Duration::from_millis(100) {
+                            let _ = terminal_tx.try_send(TerminalEvent::SetStatusBar(
+                                build_status_bar(
+                                    app_runtime_snapshot(
+                                        route,
+                                        serial_running,
+                                        rtt_running,
+                                        output_mode,
+                                        timestamp,
+                                        local_echo,
+                                        output_paused,
+                                    ),
+                                    history_bytes,
+                                    status_target_label(
+                                        route,
+                                        configured_serial_path.as_deref(),
+                                        configured_device.as_deref(),
+                                    ),
+                                ),
+                            ));
+                            last_status_bar_update = Instant::now();
+                        }
                     }
                     InterfaceEvent::Status { source, text } => {
                         let mut connection_state_changed = false;
                         if source == Source::Serial && is_serial_connected_status(&text) {
                             if !serial_running {
                                 serial_running = true;
+                                any_transport_connected = true;
                                 connection_state_changed = true;
                             }
                             if !serial_config_saved {
                                 persisted_config.target = Some(ConfigTarget::Serial);
                                 persisted_config.serial.clone_from(&configured_serial_path);
                                 persisted_config.baud = configured_baud;
-                                if let Err(e) = save_config(&persisted_config) {
+                                if let Err(e) = save_config_blocking(persisted_config.clone()).await {
                                     let _ = terminal_tx
-                                        .send(TerminalEvent::Status(format!(
+                                        .try_send(TerminalEvent::Status(format!(
                                             "[rttio] failed to save {CONFIG_FILE}: {e}\n"
-                                        )))
-                                        .await;
+                                        )));
                                 }
                                 serial_config_saved = true;
                             }
@@ -614,6 +702,7 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                         if source == Source::Rtt && is_rtt_connected_status(&text) {
                             if !rtt_running {
                                 rtt_running = true;
+                                any_transport_connected = true;
                                 connection_state_changed = true;
                             }
                             if !rtt_config_saved {
@@ -625,12 +714,11 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                                     persisted_config.device.clone_from(&configured_device);
                                     persisted_config.jlink_sn = jlink_sn;
                                     persisted_config.jlink_ip.clone_from(&jlink_ip);
-                                    if let Err(e) = save_config(&persisted_config) {
+                                    if let Err(e) = save_config_blocking(persisted_config.clone()).await {
                                         let _ = terminal_tx
-                                            .send(TerminalEvent::Status(format!(
+                                            .try_send(TerminalEvent::Status(format!(
                                                 "[rttio] failed to save {CONFIG_FILE}: {e}\n"
-                                            )))
-                                            .await;
+                                            )));
                                     }
                                 }
                                 rtt_config_saved = true;
@@ -642,48 +730,49 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                         }
                         if connection_state_changed {
                             #[cfg(feature = "control")]
-                            update_control_runtime_state(
-                                &control_state,
+                            let snapshot = app_runtime_snapshot(
+                                route,
                                 serial_running,
                                 rtt_running,
-                                route,
                                 output_mode,
                                 timestamp,
                                 local_echo,
                                 output_paused,
-                            ).await;
+                            );
+                            #[cfg(feature = "control")]
+                            update_control_runtime_state(&control_state, snapshot.control()).await;
                             #[cfg(feature = "control")]
                             send_status_bar(
                                 &terminal_tx,
                                 build_status_bar(
-                                    route,
-                                    serial_running,
-                                    rtt_running,
-                                    output_mode,
-                                    timestamp,
-                                    local_echo,
-                                    output_paused,
+                                    snapshot,
                                     control_history_bytes(&control_history).await,
+                                    status_target_label(
+                                        route,
+                                        configured_serial_path.as_deref(),
+                                        configured_device.as_deref(),
+                                    ),
                                 ),
                             ).await;
                         }
                         let rendered = format!("[rttio] {}: {}\n", source.label(), text);
-                        let _ = terminal_tx.send(TerminalEvent::Status(rendered.clone())).await;
+                        let _ = terminal_tx
+                            .send(TerminalEvent::Status(rendered.clone()))
+                            .await;
                         #[cfg(feature = "control")]
                         let _ = control_output_tx.send(rendered);
                     }
                     InterfaceEvent::Error { source, text } => {
                         let rendered = format!("[rttio] {} error: {}\n", source.label(), text);
-                        let _ = terminal_tx.send(TerminalEvent::Status(rendered.clone())).await;
+                        last_transport_error = Some(rendered.trim_end().to_string());
+                        let _ = terminal_tx
+                            .send(TerminalEvent::Status(rendered.clone()))
+                            .await;
                         #[cfg(feature = "control")]
                         let _ = control_output_tx.send(rendered);
                     }
-                    #[cfg(all(feature = "rtt", feature = "control"))]
+                    #[cfg(feature = "control")]
                     InterfaceEvent::FlashProgress(progress) => {
-                        let progress = progress.map(|progress| TerminalFlashProgress {
-                            action: progress.action,
-                            percent: progress.percent,
-                        });
                         let _ = terminal_tx
                             .send(TerminalEvent::SetFlashProgress(progress))
                             .await;
@@ -703,16 +792,18 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
                         #[cfg(feature = "control")]
                         update_control_runtime_state(
                             &control_state,
-                            serial_running,
-                            rtt_running,
-                            route,
-                            output_mode,
-                            timestamp,
-                            local_echo,
-                            output_paused,
+                            app_runtime_snapshot(
+                                route,
+                                serial_running,
+                                rtt_running,
+                                output_mode,
+                                timestamp,
+                                local_echo,
+                                output_paused,
+                            ).control(),
                         ).await;
                         let rendered = format!("[rttio] {} stopped\n", source.label());
-                        let _ = terminal_tx.send(TerminalEvent::Status(rendered.clone())).await;
+                        let _ = terminal_tx.try_send(TerminalEvent::Status(rendered.clone()));
                         #[cfg(feature = "control")]
                         let _ = control_output_tx.send(rendered);
                         if !serial_task_active && !rtt_task_active {
@@ -726,26 +817,31 @@ pub(crate) async fn run_app(opts: Opts) -> Result<()> {
     }
 
     if let Some(tx) = &serial_tx {
-        let _ = tx.send(InterfaceCommand::Stop).await;
+        let _ = tx.try_send(InterfaceCommand::Stop);
     }
     if let Some(tx) = &rtt_tx {
-        let _ = tx.send(InterfaceCommand::Stop).await;
+        let _ = tx.try_send(InterfaceCommand::Stop);
     }
     input_task.request_stop();
-    for (name, handle) in background_tasks {
-        join_task_or_abort(name, handle, Duration::from_millis(750), &terminal_tx).await;
+    for (_, handle) in background_tasks {
+        handle.abort();
     }
     #[cfg(feature = "control")]
-    abort_task("control socket", control_join, &terminal_tx).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    if !input_task.join_if_finished() {
-        terminal_status(&terminal_tx, "input thread still active during shutdown").await;
-    }
+    control_join.abort();
+    let _ = input_task.join_if_finished();
 
-    terminal_status(&terminal_tx, "rttio stopped").await;
     log_writer.flush_or_disable(&terminal_tx);
-    let _ = terminal_tx.send(TerminalEvent::Exit).await;
+    let _ = terminal_tx.try_send(TerminalEvent::Exit);
+    terminal_join.abort();
     let _ = terminal_join.await;
+    drop(_terminal);
+    let _ = write!(io::stdout(), "\r\x1b[2K[rttio] rttio stopped\r\n");
+    let _ = io::stdout().flush();
+    if !any_transport_connected {
+        if let Some(error) = last_transport_error {
+            eprintln!("{error}");
+        }
+    }
     Ok(())
 }
 
@@ -758,15 +854,26 @@ fn terminal_output_enabled(output_paused: bool, command_view_active: &Arc<Atomic
     !output_paused && !command_view_active.load(Ordering::Acquire)
 }
 
-#[cfg(feature = "control")]
-async fn send_status_bar(terminal_tx: &mpsc::Sender<TerminalEvent>, status_bar: TerminalStatusBar) {
-    let _ = terminal_tx
-        .send(TerminalEvent::SetStatusBar(status_bar))
-        .await;
+fn serial_target_actions_available(serial_running: bool) -> bool {
+    #[cfg(feature = "espflash")]
+    {
+        serial_running
+    }
+    #[cfg(not(feature = "espflash"))]
+    {
+        let _ = serial_running;
+        false
+    }
 }
 
 #[cfg(feature = "control")]
-fn build_status_bar(
+async fn send_status_bar(terminal_tx: &mpsc::Sender<TerminalEvent>, status_bar: TerminalStatusBar) {
+    let _ = terminal_tx.try_send(TerminalEvent::SetStatusBar(status_bar));
+}
+
+#[cfg(feature = "control")]
+#[derive(Clone, Copy)]
+struct AppRuntimeSnapshot {
     route: Route,
     serial_running: bool,
     rtt_running: bool,
@@ -774,22 +881,78 @@ fn build_status_bar(
     timestamp: bool,
     local_echo: bool,
     output_paused: bool,
-    history_bytes: usize,
-) -> TerminalStatusBar {
-    let target = match route {
-        Route::Serial => "serial",
-        Route::Rtt => "rtt",
-        Route::Both => "both",
-    };
-    TerminalStatusBar {
-        target,
+}
+
+#[cfg(feature = "control")]
+impl AppRuntimeSnapshot {
+    fn control(self) -> ControlRuntimeSnapshot {
+        ControlRuntimeSnapshot {
+            serial_running: self.serial_running,
+            rtt_running: self.rtt_running,
+            route: self.route,
+            output_mode: self.output_mode,
+            timestamp: self.timestamp,
+            local_echo: self.local_echo,
+            output_paused: self.output_paused,
+        }
+    }
+}
+
+#[cfg(feature = "control")]
+fn app_runtime_snapshot(
+    route: Route,
+    serial_running: bool,
+    rtt_running: bool,
+    output_mode: OutputMode,
+    timestamp: bool,
+    local_echo: bool,
+    output_paused: bool,
+) -> AppRuntimeSnapshot {
+    AppRuntimeSnapshot {
+        route,
         serial_running,
         rtt_running,
         output_mode,
         timestamp,
         local_echo,
         output_paused,
+    }
+}
+
+#[cfg(feature = "control")]
+fn build_status_bar(
+    snapshot: AppRuntimeSnapshot,
+    history_bytes: usize,
+    target_label: String,
+) -> TerminalStatusBar {
+    let target = match snapshot.route {
+        Route::Serial => "serial",
+        Route::Rtt => "rtt",
+        Route::Both => "both",
+    };
+    TerminalStatusBar {
+        target,
+        target_label,
+        serial_running: snapshot.serial_running,
+        rtt_running: snapshot.rtt_running,
+        output_mode: snapshot.output_mode,
+        timestamp: snapshot.timestamp,
+        local_echo: snapshot.local_echo,
+        output_paused: snapshot.output_paused,
         history_bytes,
         history_max_bytes: CONTROL_HISTORY_MAX_BYTES,
+    }
+}
+
+#[cfg(feature = "control")]
+fn status_target_label(route: Route, serial_path: Option<&Path>, device: Option<&str>) -> String {
+    match route {
+        Route::Serial => serial_path
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("serial")
+            .to_string(),
+        Route::Rtt => device.unwrap_or("rtt").to_string(),
+        Route::Both => "both".to_string(),
     }
 }

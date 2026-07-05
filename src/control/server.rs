@@ -10,6 +10,16 @@ pub(crate) struct ControlServerContext {
     pub(crate) line_ending: LineEnding,
 }
 
+pub(crate) struct ControlClientContext {
+    pub(crate) input_tx: mpsc::Sender<InputEvent>,
+    pub(crate) terminal_tx: mpsc::Sender<TerminalEvent>,
+    pub(crate) output_rx: broadcast::Receiver<String>,
+    pub(crate) raw_rx: broadcast::Receiver<ControlOutput>,
+    pub(crate) history: Arc<Mutex<ControlHistory>>,
+    pub(crate) state: Arc<Mutex<ControlRuntimeState>>,
+    pub(crate) line_ending: LineEnding,
+}
+
 pub(crate) async fn control_server(
     input_tx: mpsc::Sender<InputEvent>,
     context: ControlServerContext,
@@ -105,13 +115,15 @@ pub(crate) async fn control_server(
                     let _permit = permit;
                     handle_control_client(
                         stream,
-                        input_tx,
-                        terminal_tx,
-                        output_rx,
-                        raw_rx,
-                        history,
-                        state,
-                        line_ending,
+                        ControlClientContext {
+                            input_tx,
+                            terminal_tx,
+                            output_rx,
+                            raw_rx,
+                            history,
+                            state,
+                            line_ending,
+                        },
                     )
                     .await;
                 });
@@ -226,16 +238,7 @@ pub(crate) fn validate_control_socket_for_client(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn handle_control_client(
-    stream: UnixStream,
-    input_tx: mpsc::Sender<InputEvent>,
-    terminal_tx: mpsc::Sender<TerminalEvent>,
-    mut output_rx: broadcast::Receiver<String>,
-    mut raw_rx: broadcast::Receiver<ControlOutput>,
-    history: Arc<Mutex<ControlHistory>>,
-    state: Arc<Mutex<ControlRuntimeState>>,
-    line_ending: LineEnding,
-) {
+pub(crate) async fn handle_control_client(stream: UnixStream, mut context: ControlClientContext) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -252,7 +255,7 @@ pub(crate) async fn handle_control_client(
                         break;
                     }
                     loop {
-                        match output_rx.recv().await {
+                        match context.output_rx.recv().await {
                             Ok(output) => {
                                 if writer.write_all(output.as_bytes()).await.is_err() {
                                     return;
@@ -265,13 +268,15 @@ pub(crate) async fn handle_control_client(
                 }
                 let response = handle_control_line_inner(
                     &line,
-                    &input_tx,
-                    Some(&terminal_tx),
-                    &mut output_rx,
-                    &mut raw_rx,
-                    &history,
-                    &state,
-                    line_ending,
+                    ControlLineContext {
+                        input_tx: &context.input_tx,
+                        terminal_tx: Some(&context.terminal_tx),
+                        output_rx: &mut context.output_rx,
+                        raw_rx: &mut context.raw_rx,
+                        history: &context.history,
+                        state: &context.state,
+                        line_ending: context.line_ending,
+                    },
                 )
                 .await;
                 if writer.write_all(response.as_bytes()).await.is_err() {
@@ -346,27 +351,39 @@ pub(crate) async fn handle_control_line(
 ) -> String {
     handle_control_line_inner(
         line,
+        ControlLineContext {
+            input_tx,
+            terminal_tx: None,
+            output_rx,
+            raw_rx,
+            history,
+            state,
+            line_ending,
+        },
+    )
+    .await
+}
+
+struct ControlLineContext<'a> {
+    input_tx: &'a mpsc::Sender<InputEvent>,
+    terminal_tx: Option<&'a mpsc::Sender<TerminalEvent>>,
+    output_rx: &'a mut broadcast::Receiver<String>,
+    raw_rx: &'a mut broadcast::Receiver<ControlOutput>,
+    history: &'a Arc<Mutex<ControlHistory>>,
+    state: &'a Arc<Mutex<ControlRuntimeState>>,
+    line_ending: LineEnding,
+}
+
+async fn handle_control_line_inner(line: &str, context: ControlLineContext<'_>) -> String {
+    let ControlLineContext {
         input_tx,
-        None,
+        terminal_tx,
         output_rx,
         raw_rx,
         history,
         state,
         line_ending,
-    )
-    .await
-}
-
-async fn handle_control_line_inner(
-    line: &str,
-    input_tx: &mpsc::Sender<InputEvent>,
-    terminal_tx: Option<&mpsc::Sender<TerminalEvent>>,
-    output_rx: &mut broadcast::Receiver<String>,
-    raw_rx: &mut broadcast::Receiver<ControlOutput>,
-    history: &Arc<Mutex<ControlHistory>>,
-    state: &Arc<Mutex<ControlRuntimeState>>,
-    line_ending: LineEnding,
-) -> String {
+    } = context;
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return "OK\n".to_string();
@@ -469,9 +486,6 @@ async fn handle_control_line_inner(
                 );
             }
         };
-        if let Err(e) = require_active_rtt_target(state).await {
-            return control_error_response(args.json, e.to_string());
-        }
         let response = send_control_request(input_tx, args.timeout, |reply| {
             ControlRequest::Reset { reply }
         })
@@ -659,9 +673,6 @@ async fn handle_control_line_inner(
         if let Err(e) = validate_flash_file(&path) {
             return control_error_response(action_args.json, e.to_string());
         }
-        if let Err(e) = require_active_rtt_target(state).await {
-            return control_error_response(action_args.json, e.to_string());
-        }
         let addr = match addr_text.as_deref() {
             Some(value) => match parse_u32(value) {
                 Ok(addr) => addr,
@@ -700,9 +711,6 @@ async fn handle_control_line_inner(
                 );
             }
         };
-        if let Err(e) = require_active_rtt_target(state).await {
-            return control_error_response(args.json, e.to_string());
-        }
         let response = send_control_request(input_tx, args.timeout, |reply| {
             ControlRequest::Erase { reply }
         })
@@ -725,6 +733,7 @@ async fn refresh_status_bar_after_control_clear(
                 Route::Rtt => "rtt",
                 Route::Both => "both",
             },
+            target_label: control_status_target_label(&state),
             serial_running: state.serial_running,
             rtt_running: state.rtt_running,
             output_mode: state.output_mode,
@@ -740,20 +749,25 @@ async fn refresh_status_bar_after_control_clear(
         .await;
 }
 
+fn control_status_target_label(state: &ControlRuntimeState) -> String {
+    match state.route {
+        Route::Serial => state
+            .serial_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("serial")
+            .to_string(),
+        Route::Rtt => state.device.as_deref().unwrap_or("rtt").to_string(),
+        Route::Both => "both".to_string(),
+    }
+}
+
 async fn current_control_source(state: &Arc<Mutex<ControlRuntimeState>>) -> ControlSource {
     match state.lock().await.route {
         Route::Serial => ControlSource::Serial,
         Route::Rtt => ControlSource::Rtt,
         Route::Both => ControlSource::Any,
-    }
-}
-
-async fn require_active_rtt_target(state: &Arc<Mutex<ControlRuntimeState>>) -> Result<()> {
-    let state = state.lock().await;
-    if matches!(state.route, Route::Rtt | Route::Both) && state.rtt_configured {
-        Ok(())
-    } else {
-        Err(anyhow!("requires active RTT/J-Link target"))
     }
 }
 

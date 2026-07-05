@@ -1,5 +1,15 @@
 use crate::*;
 
+static CONFIG_UPDATES_DISABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_config_updates_disabled(disabled: bool) {
+    CONFIG_UPDATES_DISABLED.store(disabled, Ordering::Release);
+}
+
+pub(crate) fn config_updates_disabled() -> bool {
+    CONFIG_UPDATES_DISABLED.load(Ordering::Acquire)
+}
+
 #[cfg(feature = "rtt")]
 pub(crate) fn list_jlinks(explicit_lib: Option<PathBuf>, sn: Option<u32>) -> Result<()> {
     let candidates = default_library_candidates(explicit_lib.or_else(env_jlink_lib));
@@ -90,7 +100,16 @@ pub(crate) fn load_config_from_path(path: &Path) -> Result<RttioConfig> {
 }
 
 pub(crate) fn save_config(config: &RttioConfig) -> Result<()> {
+    if config_updates_disabled() {
+        return Ok(());
+    }
     save_config_to_path(Path::new(CONFIG_FILE), config)
+}
+
+pub(crate) async fn save_config_blocking(config: RttioConfig) -> Result<()> {
+    tokio::task::spawn_blocking(move || save_config(&config))
+        .await
+        .context("config save task failed")?
 }
 
 pub(crate) fn save_config_to_path(path: &Path, config: &RttioConfig) -> Result<()> {
@@ -101,10 +120,11 @@ pub(crate) fn save_config_to_path(path: &Path, config: &RttioConfig) -> Result<(
     config.normalize();
     let data = serde_json::to_string_pretty(&config).context("failed to serialize config")?;
     let tmp = path.with_file_name(format!(
-        "{}.tmp",
+        "{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or(CONFIG_FILE)
+            .unwrap_or(CONFIG_FILE),
+        std::process::id()
     ));
     {
         let mut file = FsOpenOptions::new()
@@ -186,17 +206,45 @@ pub(crate) fn load_config_or_default_for_ui(
     }
 }
 
-#[cfg(feature = "rtt")]
-pub(crate) fn remember_flash_file(path: &PathBuf) -> Result<()> {
+#[cfg(any(feature = "rtt", feature = "espflash"))]
+pub(crate) fn remember_flash_file(path: &Path, addr: Option<u32>) -> Result<()> {
+    if config_updates_disabled() {
+        return Ok(());
+    }
     let mut config = load_config()?;
     config.recent_flash.retain(|existing| existing != path);
-    config.recent_flash.insert(0, path.clone());
+    config.recent_flash.insert(0, path.to_path_buf());
     config.recent_flash.truncate(10);
+    if let Some(addr) = addr {
+        config.recent_flash_addr.retain(|entry| entry.path != path);
+        config.recent_flash_addr.insert(
+            0,
+            RecentFlashAddress {
+                path: path.to_path_buf(),
+                addr,
+            },
+        );
+    }
     save_config(&config)
 }
 
+#[cfg(any(feature = "rtt", feature = "espflash"))]
+pub(crate) async fn remember_flash_file_blocking(path: PathBuf, addr: Option<u32>) -> Result<()> {
+    tokio::task::spawn_blocking(move || remember_flash_file(&path, addr))
+        .await
+        .context("flash history save task failed")?
+}
+
+pub(crate) fn recent_flash_addr(config: &RttioConfig, path: &Path) -> Option<u32> {
+    config
+        .recent_flash_addr
+        .iter()
+        .find(|entry| entry.path == path)
+        .map(|entry| entry.addr)
+}
+
 pub(crate) fn is_serial_connected_status(text: &str) -> bool {
-    text == "connected"
+    text == "connected" || text.starts_with("TCP serial connected ")
 }
 
 pub(crate) fn is_rtt_connected_status(text: &str) -> bool {

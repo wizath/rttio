@@ -180,6 +180,8 @@ pub(crate) fn control_error_code(error: &str) -> &'static str {
         "not_running"
     } else if error.contains("requires RTT/J-Link")
         || error.contains("requires active RTT/J-Link")
+        || error.contains("requires target flasher")
+        || error.contains("requires ESP serial flasher")
         || error.contains("not available")
     {
         "unavailable"

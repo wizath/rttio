@@ -1,5 +1,7 @@
 use crate::*;
 
+static TIMESTAMP_START: OnceLock<Instant> = OnceLock::new();
+
 #[cfg(feature = "control")]
 pub(crate) async fn handle_control_request(
     request: ControlRequest,
@@ -20,96 +22,59 @@ pub(crate) async fn handle_control_request(
             let _ = reply.send(response);
         }
         ControlRequest::Reset { reply } => {
-            #[cfg(feature = "rtt")]
-            if let Some(tx) = rtt_tx {
-                let command = InterfaceCommand::Reset { reply: Some(reply) };
-                if let Err(e) = tx.send(command).await {
-                    if let InterfaceCommand::Reset { reply: Some(reply) } = e.0 {
-                        let _ = reply.send("ERR rtt transport is not running\n".to_string());
-                    }
-                }
-            } else {
-                let _ = reply.send("ERR reset requires RTT/J-Link\n".to_string());
-            }
-            #[cfg(not(feature = "rtt"))]
-            let _ = reply.send("ERR reset requires RTT/J-Link\n".to_string());
+            send_target_action(
+                current_route,
+                serial_tx,
+                rtt_tx,
+                InterfaceCommand::Reset { reply: Some(reply) },
+                "reset",
+            )
+            .await;
         }
         ControlRequest::Flash { path, addr, reply } => {
-            #[cfg(not(feature = "rtt"))]
-            {
-                let _ = (path, addr);
-                let _ = reply.send("ERR flash requires RTT/J-Link\n".to_string());
+            if let Err(e) = validate_flash_file(&path) {
+                let _ = reply.send(format!("ERR {e}\n"));
+                return;
             }
-            #[cfg(feature = "rtt")]
-            {
-                if let Err(e) = validate_flash_file(&path) {
-                    let _ = reply.send(format!("ERR {e}\n"));
-                    return;
-                }
-                let Some(tx) = rtt_tx else {
-                    let _ = reply.send("ERR flash requires RTT/J-Link\n".to_string());
-                    return;
-                };
-                let command = InterfaceCommand::Flash {
+            send_target_action(
+                current_route,
+                serial_tx,
+                rtt_tx,
+                InterfaceCommand::Flash {
                     path,
                     addr,
                     reply: Some(reply),
-                };
-                if let Err(e) = tx.send(command).await {
-                    if let InterfaceCommand::Flash {
-                        path,
-                        addr,
-                        reply: Some(reply),
-                    } = e.0
-                    {
-                        let _ = (path, addr);
-                        let _ = reply.send("ERR rtt transport is not running\n".to_string());
-                    }
-                }
-            }
+                },
+                "flash",
+            )
+            .await;
         }
         ControlRequest::Erase { reply } => {
-            #[cfg(feature = "rtt")]
-            if let Some(tx) = rtt_tx {
-                let command = InterfaceCommand::Erase { reply: Some(reply) };
-                if let Err(e) = tx.send(command).await {
-                    if let InterfaceCommand::Erase { reply: Some(reply) } = e.0 {
-                        let _ = reply.send("ERR rtt transport is not running\n".to_string());
-                    }
-                }
-            } else {
-                let _ = reply.send("ERR erase requires RTT/J-Link\n".to_string());
-            }
-            #[cfg(not(feature = "rtt"))]
-            let _ = reply.send("ERR erase requires RTT/J-Link\n".to_string());
+            send_target_action(
+                current_route,
+                serial_tx,
+                rtt_tx,
+                InterfaceCommand::Erase { reply: Some(reply) },
+                "erase",
+            )
+            .await;
         }
         ControlRequest::Reconnect { reply } => {
             let command = InterfaceCommand::Reconnect { reply: Some(reply) };
-            let result = match current_route {
+            match current_route {
                 Route::Serial => {
                     if let Some(tx) = serial_tx {
-                        tx.send(command).await
-                    } else {
-                        if let InterfaceCommand::Reconnect { reply: Some(reply) } = command {
-                            let _ = reply.send("ERR serial transport is not running\n".to_string());
-                        }
-                        return;
+                        send_control_command("serial", tx, command)
+                    } else if let InterfaceCommand::Reconnect { reply: Some(reply) } = command {
+                        let _ = reply.send("ERR serial transport is not running\n".to_string());
                     }
                 }
                 Route::Rtt | Route::Both => {
                     if let Some(tx) = rtt_tx {
-                        tx.send(command).await
-                    } else {
-                        if let InterfaceCommand::Reconnect { reply: Some(reply) } = command {
-                            let _ = reply.send("ERR rtt transport is not running\n".to_string());
-                        }
-                        return;
+                        send_control_command("rtt", tx, command)
+                    } else if let InterfaceCommand::Reconnect { reply: Some(reply) } = command {
+                        let _ = reply.send("ERR rtt transport is not running\n".to_string());
                     }
-                }
-            };
-            if let Err(e) = result {
-                if let InterfaceCommand::Reconnect { reply: Some(reply) } = e.0 {
-                    let _ = reply.send("ERR no transport is running\n".to_string());
                 }
             }
         }
@@ -190,6 +155,41 @@ pub(crate) async fn route_write_control(
 }
 
 #[cfg(feature = "control")]
+async fn send_target_action(
+    current_route: Route,
+    serial_tx: &Option<mpsc::Sender<InterfaceCommand>>,
+    rtt_tx: &Option<mpsc::Sender<InterfaceCommand>>,
+    command: InterfaceCommand,
+    action: &'static str,
+) {
+    let target = match current_route {
+        Route::Serial => serial_tx.as_ref().map(|tx| ("serial", tx)),
+        Route::Rtt => rtt_tx.as_ref().map(|tx| ("rtt", tx)),
+        Route::Both => rtt_tx
+            .as_ref()
+            .map(|tx| ("rtt", tx))
+            .or_else(|| serial_tx.as_ref().map(|tx| ("serial", tx))),
+    };
+    let Some((label, tx)) = target else {
+        reply_to_target_action(command, format!("ERR {action} requires target flasher\n"));
+        return;
+    };
+    send_control_command(label, tx, command);
+}
+
+#[cfg(feature = "control")]
+fn reply_to_target_action(command: InterfaceCommand, response: String) {
+    match command {
+        InterfaceCommand::Reset { reply }
+        | InterfaceCommand::Flash { reply, .. }
+        | InterfaceCommand::Erase { reply }
+        | InterfaceCommand::Write { reply, .. }
+        | InterfaceCommand::Reconnect { reply } => send_optional_control_reply(reply, response),
+        InterfaceCommand::Stop => {}
+    }
+}
+
+#[cfg(feature = "control")]
 pub(crate) async fn send_transport_write(
     name: &str,
     tx: &mpsc::Sender<InterfaceCommand>,
@@ -201,13 +201,20 @@ pub(crate) async fn send_transport_write(
         data: payload.to_vec(),
         reply: Some(reply),
     };
-    if let Err(e) = tx.send(command).await {
-        if let InterfaceCommand::Write {
-            reply: Some(reply), ..
-        } = e.0
-        {
-            let _ = reply.send(format!("ERR {name} transport is not running\n"));
-        }
+    if let Err(e) = tx.try_send(command) {
+        return match e {
+            mpsc::error::TrySendError::Full(command) => {
+                reply_to_target_action(
+                    command,
+                    format!("ERR {name} transport command queue full\n"),
+                );
+                format!("ERR {name} transport command queue full\n")
+            }
+            mpsc::error::TrySendError::Closed(command) => {
+                reply_to_target_action(command, format!("ERR {name} transport is not running\n"));
+                format!("ERR {name} transport is not running\n")
+            }
+        };
     }
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(response)) => response,
@@ -225,40 +232,51 @@ pub(crate) async fn route_write(
     match route {
         Route::Serial => {
             if let Some(tx) = serial_tx {
-                tx.send(InterfaceCommand::Write {
+                let _ = tx.try_send(InterfaceCommand::Write {
                     data: payload.to_vec(),
                     reply: None,
-                })
-                .await
-                .ok();
+                });
             }
         }
         Route::Rtt => {
             if let Some(tx) = rtt_tx {
-                tx.send(InterfaceCommand::Write {
+                let _ = tx.try_send(InterfaceCommand::Write {
                     data: payload.to_vec(),
                     reply: None,
-                })
-                .await
-                .ok();
+                });
             }
         }
         Route::Both => {
             if let Some(tx) = serial_tx {
-                tx.send(InterfaceCommand::Write {
+                let _ = tx.try_send(InterfaceCommand::Write {
                     data: payload.to_vec(),
                     reply: None,
-                })
-                .await
-                .ok();
+                });
             }
             if let Some(tx) = rtt_tx {
-                tx.send(InterfaceCommand::Write {
+                let _ = tx.try_send(InterfaceCommand::Write {
                     data: payload.to_vec(),
                     reply: None,
-                })
-                .await
-                .ok();
+                });
+            }
+        }
+    }
+}
+
+#[cfg(feature = "control")]
+fn send_control_command(
+    label: &str,
+    tx: &mpsc::Sender<InterfaceCommand>,
+    command: InterfaceCommand,
+) {
+    if let Err(e) = tx.try_send(command) {
+        match e {
+            mpsc::error::TrySendError::Full(command) => reply_to_target_action(
+                command,
+                format!("ERR {label} transport command queue full\n"),
+            ),
+            mpsc::error::TrySendError::Closed(command) => {
+                reply_to_target_action(command, format!("ERR {label} transport is not running\n"))
             }
         }
     }
@@ -280,17 +298,10 @@ pub(crate) fn handle_reconnect_wait_command(
 ) -> bool {
     match command {
         Some(InterfaceCommand::Stop) | None => true,
-        #[cfg(all(feature = "rtt", feature = "control"))]
         Some(InterfaceCommand::Reset { reply }) | Some(InterfaceCommand::Erase { reply }) => {
             send_optional_control_reply(reply, format!("ERR {reason}\n"));
             false
         }
-        #[cfg(all(feature = "rtt", not(feature = "control")))]
-        Some(InterfaceCommand::Reset { reply }) => {
-            send_optional_control_reply(reply, format!("ERR {reason}\n"));
-            false
-        }
-        #[cfg(feature = "rtt")]
         Some(InterfaceCommand::Flash { reply, .. }) => {
             send_optional_control_reply(reply, format!("ERR {reason}\n"));
             false
@@ -334,9 +345,12 @@ pub(crate) fn render_line_prefix(source: Source, timestamp: bool, prefix: bool) 
 }
 
 fn monotonic_timestamp() -> String {
-    static START: OnceLock<Instant> = OnceLock::new();
-    let elapsed = START.get_or_init(Instant::now).elapsed();
+    let elapsed = TIMESTAMP_START.get_or_init(Instant::now).elapsed();
     format!("{:06}.{:03}", elapsed.as_secs(), elapsed.subsec_millis())
+}
+
+pub(crate) fn init_timestamp_epoch() {
+    let _ = TIMESTAMP_START.set(Instant::now());
 }
 
 pub(crate) fn render_hex_data(data: &[u8], prefix: &str) -> String {
